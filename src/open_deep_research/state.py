@@ -47,6 +47,26 @@ class Summary(BaseModel):
     summary: str
     key_excerpts: str
 
+# -------- 新增：结构化事实模型 --------
+class Fact(BaseModel):
+    """从检索内容中提纯的最小知识单元"""
+    entity: str = Field(description="事实主体（如：特定设备部件、工艺参数、机构名称）")
+    claim: str = Field(description="具体的事实断言、数据或机理描述")
+    source: str = Field(description="来源出处（具体的 URL 或本地文档 ID）")
+
+class FactBoard(BaseModel):
+    """当前子主题的结构化事实看板"""
+    topic: str = Field(description="当前总结的子主题")
+    facts: List[Fact] = Field(description="提取出的高度提纯的结构化事实列表")
+
+def add_facts_reducer(current_facts: List[Fact], new_facts: List[Fact]) -> List[Fact]:
+    """事实去重归约器：基于断言内容进行基础去重，防止循环检索造成的事实冗余"""
+    if not current_facts:
+        return new_facts
+    existing_claims = {f.claim for f in current_facts}
+    unique_new = [f for f in new_facts if f.claim not in existing_claims]
+    return current_facts + unique_new
+
 
 ###################
 # 状态定义 (State Definitions)
@@ -68,7 +88,7 @@ class AgentState(MessagesState):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: Optional[str]   # 需求澄清后生成的标准调研提纲/简报需求澄清后生成的标准调研提纲/简报
     raw_notes: Annotated[list[str], override_reducer] = []  # 原始调研记录，包含所有子调研员的原始输出
-    notes: Annotated[list[str], override_reducer] = []  # 经过清洗、提炼后的高质量事实笔记
+    structured_facts: Annotated[list[str], override_reducer] = []  # 经过清洗、提炼后的高质量事实笔记
     final_report: str   # 最终交付给用户的 Markdown 长文研报
 
 class SupervisorState(TypedDict):
@@ -76,21 +96,23 @@ class SupervisorState(TypedDict):
 
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]   # Supervisor 自身的思考链与工具调用记录，与全局用户的 messages 隔离，避免 Supervisor 的内部决策污染外层对话。
     research_brief: str
-    notes: Annotated[list[str], override_reducer] = []
-    research_iterations: int = 0    # 循环安全锁。记录 Supervisor 已经派发了多少轮调研，达到上限时强制终止，防止死循环耗尽 API 额度。
     raw_notes: Annotated[list[str], override_reducer] = []
+    structured_facts: Annotated[list[str], override_reducer] = []
+    research_iterations: int = 0    # 循环安全锁。记录 Supervisor 已经派发了多少轮调研，达到上限时强制终止，防止死循环耗尽 API 额度。
 
 class ResearcherState(TypedDict):
     """独立子调研员（Researcher）的私有执行状态。"""
 
     researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]
-    tool_call_iterations: int = 0
+    raw_notes: Annotated[list[str], override_reducer] = []
     research_topic: str
     compressed_research: str
-    raw_notes: Annotated[list[str], override_reducer] = []
+    tool_call_iterations: int = 0
+
 
 class ResearcherOutputState(BaseModel):
     """子调研员执行完毕后，回传给主管智能体或全局状态的输出数据结构。"""
-    
-    compressed_research: str
+
     raw_notes: Annotated[list[str], override_reducer] = []
+    structured_facts: Annotated[list[Fact], add_facts_reducer] = []
+    compressed_research: str

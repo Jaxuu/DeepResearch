@@ -38,6 +38,8 @@ from open_deep_research.state import (
     ResearcherState,
     ResearchQuestion,
     SupervisorState,
+    FactBoard,
+    Fact
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
@@ -543,8 +545,9 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             compression_prompt = compress_research_system_prompt.format(date=get_today_str())
             messages = [SystemMessage(content=compression_prompt)] + researcher_messages
 
-            # 执行压缩
-            response = await synthesizer_model.ainvoke(messages)
+            # 执行压缩， 强制挂载 FactBoard 结构化输出
+            structured_synthesizer_model = synthesizer_model.with_structured_output(FactBoard, method="json_mode")
+            response = await structured_synthesizer_model.ainvoke(messages)
 
             # 提取所有工具消息和 AI 消息中的原始笔记
             raw_notes_content = "\n".join([
@@ -554,8 +557,9 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
 
             # 返回成功的压缩结果
             return {
-                "compressed_research": str(response.content),
-                "raw_notes": [raw_notes_content]
+                "raw_notes": [raw_notes_content],
+                "structured_facts": response.facts,
+                "compressed_research": f"Successfully extracted {len(response.facts)} structured facts."
             }
 
         except Exception as e:
@@ -576,8 +580,9 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     ])
 
     return {
-        "compressed_research": "合成研究报告时出错：超过最大重试次数",
-        "raw_notes": [raw_notes_content]
+        "raw_notes": [raw_notes_content],
+        "structured_facts": [],
+        "compressed_research": f"Failed to extract structured facts."
     }
 
 # 研究员子图构建
@@ -613,10 +618,9 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     Returns:
         Dictionary: 包含最终报告和清空的状态
     """
-    # 第1步：提取研究发现并准备状态清理
-    notes = state.get("notes", [])
-    cleared_state = {"notes": {"type": "override", "value": []}}
-    findings = "\n".join(notes)
+    # 第1步：提取结构化事实看板数据
+    structured_facts = state.get("structured_facts", [])
+    facts_to_use = structured_facts.copy()  # 用于后续可能的动态截断
 
     # 第2步：配置最终报告生成模型
     configurable = Configuration.from_runnable_config(config)
@@ -630,15 +634,31 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     # 第3步：使用 token 限制重试逻辑尝试生成报告
     max_retries = 3
     current_retry = 0
-    findings_token_limit = None
 
     while current_retry <= max_retries:
         try:
+            # 将 Pydantic 对象列表格式化为高信噪比的纯文本上下文
+            formatted_findings = []
+            for i, fact in enumerate(facts_to_use):
+                # 兼容可能是 dict 或 Pydantic BaseModel 的情况
+                entity = fact.entity if hasattr(fact, 'entity') else fact.get('entity', 'Unknown')
+                claim = fact.claim if hasattr(fact, 'claim') else fact.get('claim', '')
+                source = fact.source if hasattr(fact, 'source') else fact.get('source', '')
+
+                formatted_findings.append(
+                    f"Fact [{i + 1}]:\n"
+                    f" - Entity: {entity}\n"
+                    f" - Claim: {claim}\n"
+                    f" - Source: {source}"
+                )
+
+            findings_text = "\n\n".join(formatted_findings)
+
             # 创建包含所有研究上下文的综合提示词
             final_report_prompt = final_report_generation_prompt.format(
                 research_brief=state.get("research_brief", ""),
                 messages=get_buffer_string(state.get("messages", [])),
-                findings=findings,
+                findings=findings_text,
                 date=get_today_str()
             )
 
@@ -651,46 +671,31 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             return {
                 "final_report": final_report.content,
                 "messages": [final_report],
-                **cleared_state
             }
 
         except Exception as e:
-            # 处理 token 超限错误，渐进式截断
+            # 处理 token 超限错误：优雅地丢弃最末尾的 10% 事实，而非截断半句话
             if is_token_limit_exceeded(e, configurable.final_report_model):
                 current_retry += 1
 
-                if current_retry == 1:
-                    # 首次重试：确定初始截断限制
-                    model_token_limit = get_model_token_limit(configurable.final_report_model)
-                    if not model_token_limit:
-                        return {
-                            "final_report": f"生成最终报告时出错：Token 超限，但无法确定模型的最大上下文长度。请更新 deep_researcher/utils.py 中的模型映射表。{e}",
-                            "messages": [AIMessage(content="因 token 限制，报告生成失败")],
-                            **cleared_state
-                        }
-                    # 使用 token 限制的 4 倍作为字符数近似截断限制
-                    findings_token_limit = model_token_limit * 4
-                else:
-                    # 后续重试：每次减少 10%
-                    findings_token_limit = int(findings_token_limit * 0.9)
-
-                # 截断研究发现并重试
-                findings = findings[:findings_token_limit]
+                if len(facts_to_use) > 0:
+                    # 每次重试保留前 90% 的事实记录
+                    keep_count = max(1, int(len(facts_to_use) * 0.9))
+                    facts_to_use = facts_to_use[:keep_count]
                 continue
             else:
                 # 非 token 超限错误：立即返回错误
                 return {
                     "final_report": f"生成最终报告时出错：{e}",
-                    "messages": [AIMessage(content="因错误导致报告生成失败")],
-                    **cleared_state
+                    "messages": [AIMessage(content="因错误导致报告生成失败")]
                 }
 
-    # 第4步：如果所有重试都已耗尽，返回失败结果
+    # 第4步：如果所有重试都已耗尽
     return {
-        "final_report": "生成最终报告时出错：超过最大重试次数",
-        "messages": [AIMessage(content="超过最大重试次数后报告生成失败")],
-        **cleared_state
+        "final_report": "生成最终报告时出错：超过最大重试次数，上下文仍然过长。",
+        "messages": [AIMessage(content="超过最大重试次数后报告生成失败")]
     }
+
 
 # 主 Deep Researcher 图构建
 # 创建从用户输入到最终报告的完整深度研究工作流

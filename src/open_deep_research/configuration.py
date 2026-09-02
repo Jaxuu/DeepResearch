@@ -64,7 +64,7 @@ class Configuration(BaseModel):
         }
     )
     max_concurrent_research_units: int = Field(
-        default=5,
+        default=3,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",

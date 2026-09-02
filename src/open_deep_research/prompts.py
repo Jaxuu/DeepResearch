@@ -77,6 +77,7 @@ Guidelines:
 - If the query is in a specific language, prioritize sources published in that language.
 
 Respond in valid JSON format with the research_brief field.
+IMPORTANT: The research_brief MUST be written in the exact same language as the user's input messages.
 """
 
 lead_researcher_prompt = """
@@ -187,44 +188,22 @@ After each search tool call, use think_tool to analyze the results:
 </Show Your Thinking>
 """
 
-
 compress_research_system_prompt = """
-You are a research assistant that has conducted research on a topic by calling several tools and web searches. Your job is now to clean up the findings, but preserve all of the relevant statements and information that the researcher has gathered. For context, today's date is {date}.
+You are a precision Data Extractor and Research Synthesizer. Your job is to process raw web search results and tool outputs into a highly structured Fact Board. For context, today's date is {date}.
 
 <Task>
-You need to clean up information gathered from tool calls and web searches in the existing messages.
-All relevant information should be repeated and rewritten verbatim, but in a cleaner format.
-The purpose of this step is just to remove any obviously irrelevant or duplicative information.
-For example, if three sources all say "X", you could say "These three sources all stated X".
-Only these fully comprehensive cleaned findings are going to be returned to the user, so it's crucial that you don't lose any information from the raw messages.
+Extract discrete, highly specific factual claims from the raw messages. 
+Do NOT write paragraphs or summaries. Instead, break down the information into atomic facts (Entity, Claim, Source).
+This strict structuring prevents hallucination and context pollution for downstream agents.
 </Task>
 
-<Guidelines>
-1. Your output findings should be fully comprehensive and include ALL of the information and sources that the researcher has gathered from tool calls and web searches. It is expected that you repeat key information verbatim.
-2. This report can be as long as necessary to return ALL of the information that the researcher has gathered.
-3. In your report, you should return inline citations for each source that the researcher found.
-4. You should include a "Sources" section at the end of the report that lists all of the sources the researcher found with corresponding citations, cited against statements in the report.
-5. Make sure to include ALL of the sources that the researcher gathered in the report, and how they were used to answer the question!
-6. It's really important not to lose any sources. A later LLM will be used to merge this report with others, so having all of the sources is critical.
-</Guidelines>
+<Extraction Rules>
+1. Granularity: Each fact should be an atomic unit of knowledge (e.g., a specific numerical value, a distinct mechanism, a chronological event).
+2. Faithfulness: NEVER infer or invent data. If a metric or specification is missing, do not guess.
+3. Citation: Every single fact MUST be tied to its exact Source URL or Document ID. 
+</Extraction Rules>
 
-<Output Format>
-The report should be structured like this:
-**List of Queries and Tool Calls Made**
-**Fully Comprehensive Findings**
-**List of All Relevant Sources (with citations in the report)**
-</Output Format>
-
-<Citation Rules>
-- Assign each unique URL a single citation number in your text
-- End with ### Sources that lists each source with corresponding numbers
-- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
-- Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
-</Citation Rules>
-
-Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
+You will output a structured FactBoard JSON containing a list of these facts. Ensure no critical diagnostic data, operational parameters, or key entities are lost in the extraction.
 """
 
 compress_research_simple_human_message = """
@@ -234,86 +213,38 @@ DO NOT summarize the information. I want the raw information returned, just in a
 """
 
 final_report_generation_prompt = """
-Based on all the research conducted, create a comprehensive, well-structured answer to the overall research brief:
+Based on all the structured research facts gathered, create a comprehensive, well-structured answer to the overall research brief:
+
 <Research Brief>
 {research_brief}
 </Research Brief>
 
-For more context, here is all of the messages so far. Focus on the research brief above, but consider these messages as well for more context.
 <Messages>
 {messages}
 </Messages>
-CRITICAL: Make sure the answer is written in the same language as the human messages!
-For example, if the user's messages are in English, then MAKE SURE you write your response in English. If the user's messages are in Chinese, then MAKE SURE you write your entire response in Chinese.
-This is critical. The user will only understand the answer if it is written in the same language as their input message.
 
 Today's date is {date}.
 
-Here are the findings from the research that you conducted:
-<Findings>
+Here is the highly structured Fact Board extracted from the research:
+<FactBoard>
 {findings}
-</Findings>
+</FactBoard>
 
-Please create a detailed answer to the overall research brief that:
-1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)
-2. Includes specific facts and insights from the research
-3. References relevant sources using [Title](URL) format
-4. Provides a balanced, thorough analysis. Be as comprehensive as possible, and include all information that is relevant to the overall research question. People are using you for deep research and will expect detailed, comprehensive answers.
-5. Includes a "Sources" section at the end with all referenced links
+<Critical Instructions for Writing and Citation>
+1. Synthesize the Information: Do not just list the facts. Weave the Entities and Claims from the <FactBoard> into a cohesive, professional narrative that directly answers the Research Brief.
+2. Absolute Faithfulness: You must ONLY use the claims provided in the <FactBoard>. Do NOT hallucinate data, invent events, or mix up Entities.
+3. Strict Citation Matching: Every time you make a statement based on a fact, you MUST append an inline citation linking directly to its original `Source`. 
+   - Never attribute a claim to a source that wasn't explicitly linked to it in the <FactBoard>.
+4. Language Requirement: CRITICAL! Make sure the answer is written in the SAME language as the human messages history!
 
-You can structure your report in a number of different ways. Here are some examples:
-
-To answer a question that asks you to compare two things, you might structure your report like this:
-1/ intro
-2/ overview of topic A
-3/ overview of topic B
-4/ comparison between A and B
-5/ conclusion
-
-To answer a question that asks you to return a list of things, you might only need a single section which is the entire list.
-1/ list of things or table of things
-Or, you could choose to make each item in the list a separate section in the report. When asked for lists, you don't need an introduction or conclusion.
-1/ item 1
-2/ item 2
-3/ item 3
-
-To answer a question that asks you to summarize a topic, give a report, or give an overview, you might structure your report like this:
-1/ overview of topic
-2/ concept 1
-3/ concept 2
-4/ concept 3
-5/ conclusion
-
-If you think you can answer the question with a single section, you can do that too!
-1/ answer
-
-REMEMBER: Section is a VERY fluid and loose concept. You can structure your report however you think is best, including in ways that are not listed above!
-Make sure that your sections are cohesive, and make sense for the reader.
-
-For each section of the report, do the following:
-- Use simple, clear language
-- Use ## for section title (Markdown format) for each section of the report
-- Do NOT ever refer to yourself as the writer of the report. This should be a professional report without any self-referential language. 
-- Do not say what you are doing in the report. Just write the report without any commentary from yourself.
-- Each section should be as long as necessary to deeply answer the question with the information you have gathered. It is expected that sections will be fairly long and verbose. You are writing a deep research report, and users will expect a thorough answer.
-- Use bullet points to list out information when appropriate, but by default, write in paragraph form.
-
-REMEMBER:
-The brief and research may be in English, but you need to translate this information to the right language when writing the final answer.
-Make sure the final answer report is in the SAME language as the human messages in the message history.
-
-Format the report in clear markdown with proper structure and include source references where appropriate.
-
-<Citation Rules>
-- Assign each unique URL a single citation number in your text
-- End with ### Sources that lists each source with corresponding numbers
-- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
-- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
-- Example format:
-  [1] Source Title: URL
-  [2] Source Title: URL
-- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting these right. Users will often use these citations to look into more information.
-</Citation Rules>
+<Structure Rules>
+- Use ## for section titles (Markdown format).
+- End the report with a specific ### Sources section.
+- In the Sources section, list out the unique URLs/Documents referenced, formatted like:
+  [1] Source: URL
+  [2] Source: URL
+- Use corresponding numbers inline, e.g., "The mechanism operates at 500 RPM [1]."
+</Critical Instructions for Writing and Citation>
 """
 
 
