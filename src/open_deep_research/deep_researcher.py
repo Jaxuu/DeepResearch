@@ -27,6 +27,8 @@ from open_deep_research.prompts import (
     lead_researcher_prompt,
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
+    report_verifier_prompt,
+    rewrite_report_prompt
 )
 from open_deep_research.state import (
     AgentInputState,
@@ -39,7 +41,8 @@ from open_deep_research.state import (
     ResearchQuestion,
     SupervisorState,
     FactBoard,
-    Fact
+    Fact,
+    VerificationReport,
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
@@ -56,7 +59,7 @@ from open_deep_research.utils import (
 
 # 初始化一个可配置的模型，将在整个智能体中使用
 configurable_model = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key"),
+    configurable_fields=("model", "max_tokens", "api_key", "model_kwargs"),
 )
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
@@ -257,7 +260,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         return Command(
             goto=END,
             update={
-                "notes": get_notes_from_tool_calls(supervisor_messages),
+                "structured_facts": state.get("structured_facts", []),
                 "research_brief": state.get("research_brief", "")
             }
         )
@@ -330,6 +333,16 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             if raw_notes_concat:
                 update_payload["raw_notes"] = [raw_notes_concat]
 
+            # 收集并汇总结构化事实
+            all_structured_facts = []
+            for observation in tool_results:
+                facts = observation.get("structured_facts", [])
+                if facts:
+                    all_structured_facts.extend(facts)
+
+            if all_structured_facts:
+                update_payload["structured_facts"] = all_structured_facts
+
         except Exception as e:
             # 处理研究执行错误
             if is_token_limit_exceeded(e, configurable.research_model) or True:
@@ -337,7 +350,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 return Command(
                     goto=END,
                     update={
-                        "notes": get_notes_from_tool_calls(supervisor_messages),
+                        "structured_facts": state.get("structured_facts", []),
                         "research_brief": state.get("research_brief", "")
                     }
                 )
@@ -522,31 +535,34 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     """
     # 第1步：配置压缩模型
     configurable = Configuration.from_runnable_config(config)
-    synthesizer_model = configurable_model.with_config({
+    model_config = {
         "model": configurable.compression_model,
         "max_tokens": configurable.compression_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.compression_model, config),
         "tags": ["langsmith:nostream"]
-    })
+    }
+
+    structured_synthesizer_model = (
+        configurable_model
+        .with_structured_output(FactBoard, method="json_mode")
+        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+        .with_config(model_config)
+    )
 
     # 第2步：准备压缩用的消息
     researcher_messages = state.get("researcher_messages", [])
-
+    compression_prompt = compress_research_system_prompt.format(date=get_today_str())
     # 添加指令，从研究模式切换到压缩模式
     researcher_messages.append(HumanMessage(content=compress_research_simple_human_message))
+    messages = [SystemMessage(content=compression_prompt)] + researcher_messages
 
-    # 第3步：使用重试逻辑进行压缩，处理 token 限制问题
+    # 第3步：使用重试逻辑进行压缩，处理 token 限制问题，执行结构化提取
     synthesis_attempts = 0
     max_attempts = 3
 
     while synthesis_attempts < max_attempts:
         try:
-            # 创建聚焦压缩任务的系统提示词
-            compression_prompt = compress_research_system_prompt.format(date=get_today_str())
-            messages = [SystemMessage(content=compression_prompt)] + researcher_messages
-
             # 执行压缩， 强制挂载 FactBoard 结构化输出
-            structured_synthesizer_model = synthesizer_model.with_structured_output(FactBoard, method="json_mode")
             response = await structured_synthesizer_model.ainvoke(messages)
 
             # 提取所有工具消息和 AI 消息中的原始笔记
@@ -696,6 +712,91 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         "messages": [AIMessage(content="超过最大重试次数后报告生成失败")]
     }
 
+async def report_verifier(state: AgentState, config: RunnableConfig) -> Command[Literal["rewrite_report", "__end__"]]:
+    """核查节点：使用小模型对抗式核验成文报告的引用与断言准确率。"""
+    configurable = Configuration.from_runnable_config(config)
+    structured_facts = state.get("structured_facts", [])
+    current_report = state.get("final_report", "")
+    retries = state.get("verification_retries", 0)
+
+    # 1. 格式化 FactBoard
+    formatted_facts = "\n".join([
+        f"- Entity: {getattr(f, 'entity', 'Unknown')} | Claim: {getattr(f, 'claim', '')} | Source: {getattr(f, 'source', '')}"
+        for f in structured_facts
+    ])
+
+    # 2. 配置核查模型（选用推理能力强、成本适度的小/中模型）
+    verifier_model = (configurable_model.with_config({
+        "model": configurable.verifier_model,
+        "max_tokens": configurable.verifier_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.verifier_model, config),
+        "tags": ["langsmith:nostream"]
+    }).with_structured_output(VerificationReport, method="function_calling")        # 显式指定使用 function_calling 模式
+      .with_retry(stop_after_attempt=configurable.max_structured_output_retries)    # 挂载重试机制，捕获 Pydantic 解析异常并让 LLM 自动纠正
+    )
+
+    prompt = report_verifier_prompt.format(
+        date=get_today_str(),
+        findings=formatted_facts,
+        report=current_report
+    )
+
+    verification: VerificationReport = await verifier_model.ainvoke([HumanMessage(content=prompt)])
+
+    # 3. 判定路由逻辑：若无幻觉，或重试达到上限（防止死循环），则放行结束
+    if not verification.has_hallucinations or retries >= configurable.max_verification_retries:
+        return Command(
+            goto=END,
+            update={"verification_feedback": None}
+        )
+
+    # 存在幻觉且仍有重试预算，流转到定向重写节点
+    return Command(
+        goto="rewrite_report",
+        update={
+            "verification_feedback": verification.feedback,
+            "verification_retries": retries + 1
+        }
+    )
+
+async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[Literal["report_verifier"]]:
+    """定向修正节点：根据核查反馈剔除幻觉，重写报告。"""
+    configurable = Configuration.from_runnable_config(config)
+    structured_facts = state.get("structured_facts", [])
+    current_report = state.get("final_report", "")
+    feedback = state.get("verification_feedback", "")
+
+    formatted_facts = "\n".join([
+        f"- Entity: {getattr(f, 'entity', 'Unknown')} | Claim: {getattr(f, 'claim', '')} | Source: {getattr(f, 'source', '')}"
+        for f in structured_facts
+    ])
+
+    rewrite_prompt = rewrite_report_prompt.format(
+        date=get_today_str(),
+        findings=formatted_facts,
+        report=current_report,
+        feedback=feedback
+    )
+
+    writer_model_config = {
+        "model": configurable.rewrite_model,
+        "max_tokens": configurable.rewrite_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.rewrite_model, config),
+        "tags": ["langsmith:nostream"]
+    }
+
+    revised_report = await configurable_model.with_config(writer_model_config).ainvoke([
+        HumanMessage(content=rewrite_prompt)
+    ])
+
+    return Command(
+        goto="report_verifier",
+        update={
+            "final_report": revised_report.content,
+            "messages": [revised_report]
+        }
+    )
+
 
 # 主 Deep Researcher 图构建
 # 创建从用户输入到最终报告的完整深度研究工作流
@@ -710,11 +811,14 @@ deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)        
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # 研究规划阶段
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # 研究执行阶段
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # 报告生成阶段
+deep_researcher_builder.add_node("report_verifier", report_verifier)                 # 核查节点
+deep_researcher_builder.add_node("rewrite_report", rewrite_report)                 # 重写节点
 
 # 定义主工作流边：顺序执行
-deep_researcher_builder.add_edge(START, "clarify_with_user")                       # 入口点
+deep_researcher_builder.add_edge(START, "clarify_with_user")                                # 入口点
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation") # 研究到报告
-deep_researcher_builder.add_edge("final_report_generation", END)                   # 最终退出点
+deep_researcher_builder.add_edge("final_report_generation", "report_verifier")     # 报告到核查
+
 
 # 编译完整的深度研究工作流
 deep_researcher = deep_researcher_builder.compile()

@@ -47,7 +47,7 @@ class Summary(BaseModel):
     summary: str
     key_excerpts: str
 
-# -------- 新增：结构化事实模型 --------
+
 class Fact(BaseModel):
     """从检索内容中提纯的最小知识单元"""
     entity: str = Field(description="事实主体（如：特定设备部件、工艺参数、机构名称）")
@@ -56,8 +56,8 @@ class Fact(BaseModel):
 
 class FactBoard(BaseModel):
     """当前子主题的结构化事实看板"""
-    topic: str = Field(description="当前总结的子主题")
-    facts: List[Fact] = Field(description="提取出的高度提纯的结构化事实列表")
+    topic: str = Field(default="综合调研", description="当前总结的子主题或查询意图")
+    facts: List[Fact] = Field(default_factory=list, description="提取出的高度提纯的结构化事实列表")
 
 def add_facts_reducer(current_facts: List[Fact], new_facts: List[Fact]) -> List[Fact]:
     """事实去重归约器：基于断言内容进行基础去重，防止循环检索造成的事实冗余"""
@@ -66,6 +66,23 @@ def add_facts_reducer(current_facts: List[Fact], new_facts: List[Fact]) -> List[
     existing_claims = {f.claim for f in current_facts}
     unique_new = [f for f in new_facts if f.claim not in existing_claims]
     return current_facts + unique_new
+
+# -------- 新增：核查器使用的结构化输出模型 --------
+class CitationCheckResult(BaseModel):
+    """单条断言的核查结果"""
+    claim: str = Field(description="从报告中抽取的具体陈述或数据")
+    citation_index: Optional[int] = Field(description="该陈述对应的引用编号，若无引用则为 None")
+    is_supported: bool = Field(description="该陈述是否完全被 FactBoard 中对应的 Source 或事实完全支持")
+    reason: str = Field(description="判定支持或不支持的具体理由，指出是否存在虚假篡改或夸大")
+
+class VerificationReport(BaseModel):
+    """对抗核查汇总结果"""
+    detailed_checks: List[CitationCheckResult] = Field(description="逐句核查的过程记录。必须提取报告中所有带有引用的断言进行一对一核对。")
+    has_hallucinations: bool = Field(description="报告是否存在未被 FactBoard 支持的幻觉或错误引用")
+    citation_precision_score: float = Field(description="引用准确度评分，范围 0.0 到 1.0")
+    hallucinated_claims: List[str] = Field(default_factory=list, description="被判定位幻觉的具体语句列表")
+    feedback: str = Field(description="给重写模型的修改指导意见，清晰指出哪一段需要删除或纠正")
+
 
 
 ###################
@@ -90,6 +107,9 @@ class AgentState(MessagesState):
     raw_notes: Annotated[list[str], override_reducer] = []  # 原始调研记录，包含所有子调研员的原始输出
     structured_facts: Annotated[list[str], override_reducer] = []  # 经过清洗、提炼后的高质量事实笔记
     final_report: str   # 最终交付给用户的 Markdown 长文研报
+    # 新增字段
+    verification_feedback: Optional[str] = None
+    verification_retries: int = 0
 
 class SupervisorState(TypedDict):
     """主管智能体（Supervisor）的专用状态，负责管理和派发调研任务。"""
@@ -116,3 +136,4 @@ class ResearcherOutputState(BaseModel):
     raw_notes: Annotated[list[str], override_reducer] = []
     structured_facts: Annotated[list[Fact], add_facts_reducer] = []
     compressed_research: str
+

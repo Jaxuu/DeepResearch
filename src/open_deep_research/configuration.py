@@ -41,18 +41,6 @@ class Configuration(BaseModel):
     """Deep Research 智能体的主配置类。"""
 
     # 通用配置
-    max_structured_output_retries: int = Field(
-        default=3,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 3,
-                "min": 1,
-                "max": 10,
-                "description": "Maximum number of retries for structured output calls from models"
-            }
-        }
-    )
     allow_clarification: bool = Field(
         default=True,
         metadata={
@@ -73,6 +61,30 @@ class Configuration(BaseModel):
                 "max": 20,
                 "step": 1,
                 "description": "Maximum number of research units to run concurrently. This will allow the researcher to use multiple sub-agents to conduct research. Note: with more concurrency, you may run into rate limits."
+            }
+        }
+    )
+    max_structured_output_retries: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 3,
+                "min": 1,
+                "max": 10,
+                "description": "Maximum number of retries for structured output calls from models"
+            }
+        }
+    )
+    max_verification_retries: int = Field(
+        default=2,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 2,
+                "min": 1,
+                "max": 4,
+                "description": "Maximum number of retries for verification calls from models"
             }
         }
     )
@@ -120,26 +132,6 @@ class Configuration(BaseModel):
         }
     )
     # 模型配置
-    summarization_model: str = Field(
-        default=os.getenv("SUMMARIZATION_MODEL"),
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": os.getenv("SUMMARIZATION_MODEL"),
-                "description": "Model for summarizing research results from Tavily search results"
-            }
-        }
-    )
-    summarization_model_max_tokens: int = Field(
-        default=8192,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 8192,
-                "description": "Maximum output tokens for summarization model"
-            }
-        }
-    )
     max_content_length: int = Field(
         default=12000,
         metadata={
@@ -169,6 +161,26 @@ class Configuration(BaseModel):
                 "type": "number",
                 "default": 10000,
                 "description": "Maximum output tokens for research model"
+            }
+        }
+    )
+    summarization_model: str = Field(
+        default=os.getenv("SUMMARIZATION_MODEL"),
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": os.getenv("SUMMARIZATION_MODEL"),
+                "description": "Model for summarizing research results from Tavily search results"
+            }
+        }
+    )
+    summarization_model_max_tokens: int = Field(
+        default=8192,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 8192,
+                "description": "Maximum output tokens for summarization model"
             }
         }
     )
@@ -209,6 +221,46 @@ class Configuration(BaseModel):
                 "type": "number",
                 "default": 10000,
                 "description": "Maximum output tokens for final report model"
+            }
+        }
+    )
+    verifier_model: str = Field(
+        default=os.getenv("VERIFIER_MODEL"),
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": os.getenv("VERIFIER_MODEL"),
+                "description": "Model for verifying the generated report"
+            }
+        }
+    )
+    verifier_model_max_tokens: int = Field(
+        default=10000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 10000,
+                "description": "Maximum output tokens for verifier model"
+            }
+        }
+    )
+    rewrite_model: str = Field(
+        default=os.getenv("REWRITE_MODEL"),
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": os.getenv("REWRITE_MODEL"),
+                "description": "Model for rewriting the generated report"
+            }
+        }
+    )
+    rewrite_model_max_tokens: int = Field(
+        default=10000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 10000,
+                "description": "Maximum output tokens for verifier model"
             }
         }
     )
