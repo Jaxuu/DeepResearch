@@ -110,6 +110,8 @@ class AgentState(MessagesState):
     # 新增字段
     verification_feedback: Optional[str] = None
     verification_retries: int = 0
+    # 【新增字段】：剪枝追踪器
+    consecutive_low_gain_rounds: int
 
 class SupervisorState(TypedDict):
     """主管智能体（Supervisor）的专用状态，负责管理和派发调研任务。"""
@@ -119,6 +121,8 @@ class SupervisorState(TypedDict):
     raw_notes: Annotated[list[str], override_reducer] = []
     structured_facts: Annotated[list[str], override_reducer] = []
     research_iterations: int = 0    # 循环安全锁。记录 Supervisor 已经派发了多少轮调研，达到上限时强制终止，防止死循环耗尽 API 额度。
+    # 【新增字段】：剪枝追踪器
+    consecutive_low_gain_rounds: int
 
 class ResearcherState(TypedDict):
     """独立子调研员（Researcher）的私有执行状态。"""

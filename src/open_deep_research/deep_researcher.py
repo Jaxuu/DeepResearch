@@ -343,6 +343,50 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             if all_structured_facts:
                 update_payload["structured_facts"] = all_structured_facts
 
+            # 基于信息增益的动态剪枝
+            existing_facts = state.get("structured_facts", [])
+            # 提取已有的所有断言，用于查重
+            existing_claims = {getattr(f, 'claim', '') for f in existing_facts}
+
+            new_unique_facts_count = 0
+            for fact in all_structured_facts:
+                claim = getattr(fact, 'claim', '')
+                if claim and claim not in existing_claims:
+                    new_unique_facts_count += 1
+                    existing_claims.add(claim)
+
+            # 获取当前的连续低增益轮数
+            low_gain_rounds = state.get("consecutive_low_gain_rounds", 0)
+
+            if new_unique_facts_count == 0:
+                low_gain_rounds += 1
+                print(f"\n[✂️ 动态剪枝追踪] 本轮检索产生 0 条全新事实。当前连续停滞轮数: {low_gain_rounds}")
+            else:
+                low_gain_rounds = 0  # 只要有新发现，重置计数器
+                print(f"\n[📈 信息增益检测] 本轮新增 {new_unique_facts_count} 条独立高优事实。")
+
+            update_payload["consecutive_low_gain_rounds"] = low_gain_rounds
+
+            # 触发强制熔断条件（连续 2 轮未获取新事实，或大模型主动停止）
+            if low_gain_rounds >= 2:
+                print("\n[🛑 强制熔断触发] 知识图谱已饱和，提早终止 Supervisor 盲目派发，进入成文阶段。")
+                return Command(
+                    goto=END,
+                    update=update_payload  # 携带最新的状态强制退出
+                )
+
+            # 如果处于低增益状态但还没熔断，给 Supervisor 智能体发一条严重警告
+            if new_unique_facts_count == 0 and low_gain_rounds == 1:
+                print("\n[⚠️ 发送系统警告] 提醒 Supervisor 改变策略或提早结束。")
+                # 安全做法：直接把警告追加到刚刚执行完的最后一个工具调用的返回内容里
+                if all_tool_messages:
+                    all_tool_messages[-1].content += (
+                        "\n\n[SYSTEM WARNING: CRITICAL ALERT]\n"
+                        "Your last delegation yielded ZERO new unique facts. The search space is saturating. "
+                        "You MUST drastically change your search strategy (use completely different keywords) "
+                        "OR call 'ResearchComplete' immediately to avoid wasting resources."
+                    )
+
         except Exception as e:
             # 处理研究执行错误
             if is_token_limit_exceeded(e, configurable.research_model) or True:
