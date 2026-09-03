@@ -93,7 +93,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     # 配置模型：结构化输出 + 重试逻辑
     clarification_model = (
         configurable_model
-        .with_structured_output(ClarifyWithUser)
+        .with_structured_output(ClarifyWithUser,method="json_mode")
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(model_config)
     )

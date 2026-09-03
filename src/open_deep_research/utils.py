@@ -6,8 +6,13 @@ import os
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
-
 import aiohttp
+from contextlib import AsyncExitStack
+
+from tavily import AsyncTavilyClient
+from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.session import ClientSession
+
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -25,9 +30,7 @@ from langchain_core.tools import (
     tool,
 )
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.config import get_store
-from mcp import McpError
-from tavily import AsyncTavilyClient
+from langchain_mcp_adapters.tools import load_mcp_tools as load_langchain_mcp_tools
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
@@ -252,283 +255,53 @@ def think_tool(reflection: str) -> str:
 ##########################
 # MCP 工具组件
 ##########################
+# 模拟企业级架构中的“连接池单例”
+# 保证跨越 Supervisor 和 Sub-agent 多个节点时，网络通道持久存活
+_mcp_client = None
 
-async def get_mcp_access_token(
-    supabase_token: str,
-    base_mcp_url: str,
-) -> Optional[Dict[str, Any]]:
-    """使用 OAuth Token 交换机制，将 Supabase Token 换取为 MCP 访问 Token。
-
-    参数:
-        supabase_token: 有效的 Supabase 身份验证 Token
-        base_mcp_url: MCP 服务器的基础 URL
-
-    返回:
-        若成功返回包含 Token 数据的字典，失败则返回 None
-    """
-    try:
-        # 准备 OAuth Token 交换的请求数据
-        form_data = {
-            "client_id": "mcp_default",
-            "subject_token": supabase_token,
-            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-            "resource": base_mcp_url.rstrip("/") + "/mcp",
-            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        }
-
-        # 执行 Token 交换请求
-        async with aiohttp.ClientSession() as session:
-            token_url = base_mcp_url.rstrip("/") + "/oauth/token"
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-            async with session.post(token_url, headers=headers, data=form_data) as response:
-                if response.status == 200:
-                    # 成功获取 Token
-                    token_data = await response.json()
-                    return token_data
-                else:
-                    # 记录错误详情以便调试
-                    response_text = await response.text()
-                    logging.error(f"Token exchange failed: {response_text}")
-
-    except Exception as e:
-        logging.error(f"Error during token exchange: {e}")
-
-    return None
-
-async def get_tokens(config: RunnableConfig):
-    """从存储中获取带有过期验证的身份验证 Token。
-
-    参数:
-        config: 包含线程和用户标识符的运行时配置
-
-    返回:
-        若有效且未过期返回 Token 字典，否则返回 None
-    """
-    store = get_store()
-
-    # 从配置中提取所需的标识符
-    thread_id = config.get("configurable", {}).get("thread_id")
-    if not thread_id:
-        return None
-
-    user_id = config.get("metadata", {}).get("owner")
-    if not user_id:
-        return None
-
-    # 获取已存储的 Token
-    tokens = await store.aget((user_id, "tokens"), "data")
-    if not tokens:
-        return None
-
-    # 检查 Token 是否过期
-    expires_in = tokens.value.get("expires_in")  # 距离过期的秒数
-    created_at = tokens.created_at  # Token 创建时间
-    current_time = datetime.now(timezone.utc)
-    expiration_time = created_at + timedelta(seconds=expires_in)
-
-    if current_time > expiration_time:
-        # Token 已过期，清理并返回 None
-        await store.adelete((user_id, "tokens"), "data")
-        return None
-
-    return tokens.value
-
-async def set_tokens(config: RunnableConfig, tokens: dict[str, Any]):
-    """将身份验证 Token 保存到配置存储中。
-
-    参数:
-        config: 包含线程和用户标识符的运行时配置
-        tokens: 要存储的 Token 字典
-    """
-    store = get_store()
-
-    # 从配置中提取所需的标识符
-    thread_id = config.get("configurable", {}).get("thread_id")
-    if not thread_id:
-        return
-
-    user_id = config.get("metadata", {}).get("owner")
-    if not user_id:
-        return
-
-    # 存储 Token
-    await store.aput((user_id, "tokens"), "data", tokens)
-
-async def fetch_tokens(config: RunnableConfig) -> dict[str, Any]:
-    """获取并刷新 MCP Token，必要时重新获取新 Token。
-
-    参数:
-        config: 包含身份验证详情的运行时配置
-
-    返回:
-        有效的 Token 字典，若无法获取则返回 None
-    """
-    # 优先尝试获取现有有效的 Token
-    current_tokens = await get_tokens(config)
-    if current_tokens:
-        return current_tokens
-
-    # 提取 Supabase Token 用于新的 Token 交换
-    supabase_token = config.get("configurable", {}).get("x-supabase-access-token")
-    if not supabase_token:
-        return None
-
-    # 提取 MCP 配置
-    mcp_config = config.get("configurable", {}).get("mcp_config")
-    if not mcp_config or not mcp_config.get("url"):
-        return None
-
-    # 使用 Supabase Token 换取 MCP Token
-    mcp_tokens = await get_mcp_access_token(supabase_token, mcp_config.get("url"))
-    if not mcp_tokens:
-        return None
-
-    # 存储新 Token 并返回
-    await set_tokens(config, mcp_tokens)
-    return mcp_tokens
-
-def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
-    """为 MCP 工具包装完善的身份验证与错误处理逻辑。
-
-    参数:
-        tool: 要包装的 MCP 结构化工具
-
-    返回:
-        增强了身份验证错误处理的工具
-    """
-    original_coroutine = tool.coroutine
-
-    async def authentication_wrapper(**kwargs):
-        """增强的协程函数，包含 MCP 错误处理和用户友好的提示信息。"""
-
-        def _find_mcp_error_in_exception_chain(exc: BaseException) -> McpError | None:
-            """在异常链中递归查找 MCP 相关错误。"""
-            if isinstance(exc, McpError):
-                return exc
-
-            # 通过检查属性处理 ExceptionGroup（Python 3.11+）
-            if hasattr(exc, 'exceptions'):
-                for sub_exception in exc.exceptions:
-                    if found_error := _find_mcp_error_in_exception_chain(sub_exception):
-                        return found_error
-            return None
-
-        try:
-            # 执行原始工具功能
-            return await original_coroutine(**kwargs)
-
-        except BaseException as original_error:
-            # 在异常链中搜索 MCP 特定的错误
-            mcp_error = _find_mcp_error_in_exception_chain(original_error)
-            if not mcp_error:
-                # 非 MCP 错误，重新抛出原始异常
-                raise original_error
-
-            # 处理 MCP 特定的错误情况
-            error_details = mcp_error.error
-            error_code = getattr(error_details, "code", None)
-            error_data = getattr(error_details, "data", None) or {}
-
-            # 检查是否为需要身份验证/交互的错误
-            if error_code == -32003:  # 需要交互的错误代码
-                message_payload = error_data.get("message", {})
-                error_message = "Required interaction"
-
-                # 提取用户友好的提示信息（若存在）
-                if isinstance(message_payload, dict):
-                    error_message = message_payload.get("text") or error_message
-
-                # 若提供 URL 则追加供用户参考
-                if url := error_data.get("url"):
-                    error_message = f"{error_message} {url}"
-
-                raise ToolException(error_message) from original_error
-
-            # 对于其他 MCP 错误，重新抛出原始异常
-            raise original_error
-
-    # 将工具的原协程替换为增强版本
-    tool.coroutine = authentication_wrapper
-    return tool
 
 async def load_mcp_tools(
-    config: RunnableConfig,
-    existing_tool_names: set[str],
-) -> list[BaseTool]:
-    """加载并配置带有身份验证的 MCP（模型上下文协议）工具。
+        config,
+        existing_tool_names: set[str],
+):
+    """加载标准的远端 MCP 工具 (基于官方 MultiServerMCPClient 封装)"""
+    global _mcp_client
 
-    参数:
-        config: 包含 MCP 服务器详情的运行时配置
-        existing_tool_names: 已使用的工具名称集合，用于避免名称冲突
-
-    返回:
-        已配置且可直接使用的 MCP 工具列表
-    """
-    configurable = Configuration.from_runnable_config(config)
-
-    # 步骤 1：若需要则处理身份验证
-    if configurable.mcp_config and configurable.mcp_config.auth_required:
-        mcp_tokens = await fetch_tokens(config)
-    else:
-        mcp_tokens = None
-
-    # 步骤 2：校验配置要求
-    config_valid = (
-        configurable.mcp_config and
-        configurable.mcp_config.url and
-        configurable.mcp_config.tools and
-        (mcp_tokens or not configurable.mcp_config.auth_required)
-    )
-
-    if not config_valid:
-        return []
-
-    # 步骤 3：建立 MCP 服务器连接
-    server_url = configurable.mcp_config.url.rstrip("/") + "/mcp"
-
-    # 若 Token 可用则配置身份验证请求头
-    auth_headers = None
-    if mcp_tokens:
-        auth_headers = {"Authorization": f"Bearer {mcp_tokens['access_token']}"}
-
-    mcp_server_config = {
-        "server_1": {
-            "url": server_url,
-            "headers": auth_headers,
-            "transport": "streamable_http"
+    # 混合 MCP 配置字典
+    mcp_config = {
+        "industrial_rag": {
+            "transport": "sse",
+            "url": "http://127.0.0.1:8080/sse"
+        },
+        "sqlite_db": {
+            "transport": "sse",
+            "url": "http://127.0.0.1:8001/sse"
         }
     }
-    # TODO: 当 Multi-MCP Server 支持合并到 OAP 后更新此代码
 
-    # 步骤 4：从 MCP 服务器加载工具
     try:
-        client = MultiServerMCPClient(mcp_server_config)
-        available_mcp_tools = await client.get_tools()
-    except Exception:
-        # 若 MCP 服务器连接失败，返回空列表
+        # 如果是第一次请求，初始化官方高阶客户端
+        if _mcp_client is None:
+            _mcp_client = MultiServerMCPClient(mcp_config)
+            # 对于 0.1.0 版本的 langchain-mcp-adapters，直接使用其内部 session
+
+        # 一行代码拉取所有可用工具
+        available_tools = await _mcp_client.get_tools()
+
+        # 调试信息：确保拿到工具
+        print(f"\n[🔌 MCP 挂载成功 (SSE 模式)] 获取私有库工具: {[t.name for t in available_tools]}")
+
+    except Exception as e:
+        print(f"\n[⚠️ MCP 连接失败] 请检查 Server 是否在 8080 端口启动: {e}")
         return []
 
-    # 步骤 5：过滤并配置工具
+    # 过滤重复工具
     configured_tools = []
-    for mcp_tool in available_mcp_tools:
-        # 跳过名称冲突的工具
-        if mcp_tool.name in existing_tool_names:
-            warnings.warn(
-                f"MCP tool '{mcp_tool.name}' conflicts with existing tool name - skipping"
-            )
-            continue
-
-        # 仅包含配置中显式指定的工具
-        if mcp_tool.name not in set(configurable.mcp_config.tools):
-            continue
-
-        # 为工具包装身份验证处理并添加到列表
-        enhanced_tool = wrap_mcp_authenticate_tool(mcp_tool)
-        configured_tools.append(enhanced_tool)
+    for mcp_tool in available_tools:
+        if mcp_tool.name not in existing_tool_names:
+            configured_tools.append(mcp_tool)
 
     return configured_tools
-
 
 ##########################
 # 基础工具组件

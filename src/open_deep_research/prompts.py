@@ -38,6 +38,9 @@ For the verification message when no clarification is needed:
 - Briefly summarize the key aspects of what you understand from their request
 - Confirm that you will now begin the research process
 - Keep the message concise and professional
+
+CRITICAL: You MUST output a valid JSON object matching the schema. 
+DO NOT output plain text like "need_clarification".
 """
 
 
@@ -97,20 +100,32 @@ You have access to three main tools:
 **CRITICAL: Use think_tool before calling ConductResearch to plan your approach, and after each ConductResearch to assess progress. Do not call think_tool with any other tools in parallel.**
 </Available Tools>
 
+<Crucial Resource Awareness>
+IMPORTANT: Your team has access to TWO distinct search modalities:
+1. Web Search (Tavily): For external market data, news, public information, and e-commerce prices.
+2. Internal Industrial RAG (via MCP Tools): For strictly confidential technical parameters, equipment manuals, internal specifications, and operational data.
+
+When the user asks for technical specs, internal data, or specific equipment parameters (e.g., "内部知识库", "设备参数", "宏发继电器"), you MUST formulate the `research_topic` explicitly instructing the researcher to prioritize the INTERNAL KNOWLEDGE BASE tools.
+</Crucial Resource Awareness>
+
 <Instructions>
 Think like a research manager with limited time and resources. Follow these steps:
-
 1. **Read the question carefully** - What specific information does the user need?
 2. **Decide how to delegate the research** - Carefully consider the question and decide how to delegate the research. Are there multiple independent directions that can be explored simultaneously?
 3. **After each call to ConductResearch, pause and assess** - Do I have enough to answer? What's still missing?
 </Instructions>
 
+<Anti-Loop & RAG Strategy>
+1. ALWAYS INITIATE: You MUST delegate at least once to the internal knowledge base if the user asks for technical specs.
+2. ACCEPT PARTIAL DATA: If the sub-agent returns partial information (e.g., they found the base voltage but not the tolerance), consider that aspect COMPLETE. Do NOT delegate a new sub-agent to search for the missing pieces of that exact same parameter.
+3. PROCEED: Once you have partial or full internal data, move on to web search for market data, or call `ResearchComplete`.
+</Anti-Loop & RAG Strategy>
+
 <Hard Limits>
 **Task Delegation Budgets** (Prevent excessive delegation):
-- **Bias towards single agent** - Use single agent for simplicity unless the user request has clear opportunity for parallelization
+- **Bias towards single agent** - Unless the user requests the use of multiple tools or there are clear opportunities for parallelization, then a single agent should be used.
 - **Stop when you can answer confidently** - Don't keep delegating research for perfection
 - **Limit tool calls** - Always stop after {max_researcher_iterations} tool calls to ConductResearch and think_tool if you cannot find the right sources
-
 **Maximum {max_concurrent_research_units} parallel agents per iteration**
 </Hard Limits>
 
@@ -156,6 +171,20 @@ You have access to two main tools:
 
 **CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with the tavily_search or any other tools. It should be to reflect on the results of the search.**
 </Available Tools>
+
+<Tool Selection Strategy & Anti-Spam Rules>
+You have multiple distinct tools at your disposal:
+1. `search_equipment_knowledge`: Use this FIRST for internal unstructured manuals and technical specs. (CALL ONCE PER TOPIC).
+2. `query_erp_database`: Use this to run SQL queries against the internal ERP database for exact inventory stock, pricing, and warehouse locations. Table: inventory.
+3. `tavily_search`: Use this for broad internet web search (e.g., e-commerce prices, news).
+</Tool Selection Strategy & Anti-Spam Rules>
+
+<Internal RAG Tool Rules (CRITICAL)>
+The internal knowledge base tool (`search_equipment_knowledge`) uses semantic vector search. It is highly accurate but DETERMINISTIC.
+1. DO NOT SPAM: Call the internal knowledge tool exactly ONCE per assigned task.
+2. EMBRACE PARTIAL DATA: If the tool returns documents, you MUST extract and report ANY relevant technical parameters you find (e.g., base voltage), even if some specific details (e.g., voltage tolerance) are missing. 
+3. DO NOT treat partial success as a failure. Never retry the internal tool with different keywords. Report whatever partial facts you found, use `think_tool` to acknowledge the missing parts, and conclude your research.
+</Internal RAG Tool Rules (CRITICAL)>
 
 <Instructions>
 Think like a human researcher with limited time. Follow these steps:

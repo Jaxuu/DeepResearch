@@ -195,7 +195,7 @@ class Configuration(BaseModel):
         }
     )
     compression_model_max_tokens: int = Field(
-        default=8192,
+        default=10000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
@@ -215,7 +215,7 @@ class Configuration(BaseModel):
         }
     )
     final_report_model_max_tokens: int = Field(
-        default=10000,
+        default=12000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
