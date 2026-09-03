@@ -301,7 +301,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                     "researcher_messages": [
                         HumanMessage(content=tool_call["args"]["research_topic"])
                     ],
-                    "research_topic": tool_call["args"]["research_topic"]
+                    "research_topic": tool_call["args"]["research_topic"],
+                    "required_tools": tool_call["args"].get("required_tools", ["tavily_search"])
                 }, config)
                 for tool_call in allowed_conduct_research_calls
             ]
@@ -444,6 +445,19 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
             "未找到可用于研究的工具：请配置您的搜索 API 或在配置中添加 MCP 工具。"
         )
 
+    # 精准挂载分配的技能
+    allowed_tool_names = state.get("required_tools", ["tavily_search"])
+    active_tools = []
+
+    for tool in tools:
+        tool_name = tool.name if hasattr(tool, "name") else tool.get("name", "web_search")
+        # 永远保留思考节点，并挂载 Supervisor 准许的业务工具
+        if tool_name == "think_tool" or tool_name in allowed_tool_names:
+            active_tools.append(tool)
+
+    active_tool_names = [t.name if hasattr(t, "name") else t.get("name") for t in active_tools]
+    print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
+
     # 第2步：配置研究员模型及工具
     research_model_config = {
         "model": configurable.research_model,
@@ -461,7 +475,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     # 配置模型：绑定工具 + 重试逻辑 + 设置
     research_model = (
         configurable_model
-        .bind_tools(tools)
+        .bind_tools(active_tools)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(research_model_config)
     )

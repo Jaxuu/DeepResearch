@@ -1,7 +1,6 @@
 """Deep Research 智能体的图状态定义与数据结构。"""
-
 import operator
-from typing import Annotated, Optional, List
+from typing import Annotated, Optional, List, Union
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
@@ -37,6 +36,11 @@ class ConductResearch(BaseModel):
     research_topic: str = Field(
         description="待调研的具体子主题。必须是单一主题，且需包含高度详尽的描述（至少一段话）。",
     )
+    # 【新增】：技能清单，带上备选工具的枚举说明
+    required_tools: List[str] = Field(
+        description="The specific tools this agent should have access to. Options: 'tavily_search', 'search_equipment_knowledge', 'query_erp_database'",
+        default=["tavily_search"]
+    )
 
 class ResearchComplete(BaseModel):
     """调用此工具表示所有调研工作已完成。"""
@@ -71,7 +75,8 @@ def add_facts_reducer(current_facts: List[Fact], new_facts: List[Fact]) -> List[
 class CitationCheckResult(BaseModel):
     """单条断言的核查结果"""
     claim: str = Field(description="从报告中抽取的具体陈述或数据")
-    citation_index: Optional[int] = Field(description="该陈述对应的引用编号，若无引用则为 None")
+    citation_index: Union[int, List[int], None] = Field(default=None,
+        description="The index or list of indices of the citation(s) supporting the claim.")
     is_supported: bool = Field(description="该陈述是否完全被 FactBoard 中对应的 Source 或事实完全支持")
     reason: str = Field(description="判定支持或不支持的具体理由，指出是否存在虚假篡改或夸大")
 
@@ -132,6 +137,7 @@ class ResearcherState(TypedDict):
     research_topic: str
     compressed_research: str
     tool_call_iterations: int = 0
+    required_tools: list[str]  # <--- 新增这行，让打工人合法持有这个属性
 
 
 class ResearcherOutputState(BaseModel):

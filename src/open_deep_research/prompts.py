@@ -100,6 +100,17 @@ You have access to three main tools:
 **CRITICAL: Use think_tool before calling ConductResearch to plan your approach, and after each ConductResearch to assess progress. Do not call think_tool with any other tools in parallel.**
 </Available Tools>
 
+<Dynamic Tool Allocation (CRITICAL)>
+When calling `ConductResearch`, you MUST assign ONLY the necessary tools using the `required_tools` field. Do not overload sub-agents with unused tools.
+
+Available Tool Options:
+- `tavily_search`: For external internet search (e-commerce, news, competitors).
+- `search_equipment_knowledge`: For internal technical manuals, parameters, or unstructured specs (RAG).
+- `query_erp_database`: For structured internal data like warehouse stock, inventory quantities, and exact ERP prices.
+
+You can assign multiple tools if a specific sub-topic requires cross-referencing, but prefer 1-2 tools maximum per agent.
+</Dynamic Tool Allocation (CRITICAL)>
+
 <Crucial Resource Awareness>
 IMPORTANT: Your team has access to TWO distinct search modalities:
 1. Web Search (Tavily): For external market data, news, public information, and e-commerce prices.
