@@ -9,6 +9,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    RemoveMessage,
     filter_messages,
     get_buffer_string,
 )
@@ -605,48 +606,49 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             # 执行压缩， 强制挂载 FactBoard 结构化输出
             response = await structured_synthesizer_model.ainvoke(messages)
 
-            # 提取所有工具消息和 AI 消息中的原始笔记
-            raw_notes_content = "\n".join([
-                str(message.content)
-                for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
-            ])
+            # 提取当前子图中所有消息的 ID (包含庞大的 ToolMessage)
+            delete_messages = [
+                RemoveMessage(id=m.id)
+                for m in state.get("researcher_messages", [])
+                if getattr(m, 'id', None) is not None
+            ]
 
             # 返回标准 TypedDict，LangGraph 会自动将其归约到 Supervisor 状态
             return {
-                "raw_notes": [raw_notes_content],
                 "staged_facts": response.facts,
                 "supervisor_messages": [ToolMessage(
                     content=f"Successfully extracted {len(response.facts)} structured facts.",
                     name="ConductResearch",
                     tool_call_id=state.get("tool_call_id", "")
-                )]
+                )],
+                # 下发销毁指令给底层 Checkpointer
+                "researcher_messages": delete_messages
             }
 
         except Exception as e:
             synthesis_attempts += 1
-
             # 处理 token 超限，通过移除较旧的消息
             if is_token_limit_exceeded(e, configurable.research_model):
                 researcher_messages = remove_up_to_last_ai_message(researcher_messages)
                 continue
-
             # 其他错误，继续重试
             continue
 
-    # 第4步：如果所有尝试都失败，返回错误结果
-    raw_notes_content = "\n".join([
-        str(message.content)
-        for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
-    ])
+    # 第4步：如果所有尝试都失败，返回错误结果,同样执行垃圾回收
+    delete_messages = [
+        RemoveMessage(id=m.id)
+        for m in state.get("researcher_messages", [])
+        if getattr(m, 'id', None) is not None
+    ]
 
     return {
-        "raw_notes": [raw_notes_content],
         "staged_facts": [],
         "supervisor_messages": [ToolMessage(
             content="Failed to extract structured facts.",
             name="ConductResearch",
             tool_call_id=state.get("tool_call_id", "")
-        )]
+        )],
+        "researcher_messages": delete_messages
     }
 
 # 研究员子图构建

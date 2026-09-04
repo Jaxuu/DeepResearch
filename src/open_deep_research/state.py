@@ -4,6 +4,7 @@ from typing import Annotated, Optional, List, Union, Any
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
+from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -109,7 +110,6 @@ class AgentState(MessagesState):
 
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: Optional[str]   # 需求澄清后生成的标准调研提纲/简报需求澄清后生成的标准调研提纲/简报
-    raw_notes: Annotated[list[str], override_reducer] = []  # 原始调研记录，包含所有子调研员的原始输出
     structured_facts: Annotated[list[Fact], add_facts_reducer] = []  # 经过清洗、提炼后的高质量事实笔记
     final_report: str   # 最终交付给用户的 Markdown 长文研报
     verification_feedback: Optional[str] = None
@@ -121,17 +121,15 @@ class SupervisorState(TypedDict):
 
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]   # Supervisor 自身的思考链与工具调用记录，与全局用户的 messages 隔离，避免 Supervisor 的内部决策污染外层对话。
     research_brief: str
-    raw_notes: Annotated[list[str], override_reducer] = []
-    structured_facts: Annotated[list[Fact], add_facts_reducer] = []
-    staged_facts: Annotated[list[Fact], override_reducer] = []
+    structured_facts: Annotated[list[Fact], add_facts_reducer] = [] # 经过清洗、提炼后的高质量事实笔记
+    staged_facts: Annotated[list[Fact], override_reducer] = []  # 暂存最新的事实列表，用来和structured_facts对比实现熔断
     research_iterations: int = 0    # 循环安全锁。记录 Supervisor 已经派发了多少轮调研，达到上限时强制终止，防止死循环耗尽 API 额度。
     consecutive_low_gain_rounds: int = 0
 
 class ResearcherState(TypedDict):
     """独立子调研员（Researcher）的私有执行状态。"""
 
-    researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]
-    raw_notes: Annotated[list[str], override_reducer] = []
+    researcher_messages: Annotated[list[MessageLikeRepresentation], add_messages]
     research_topic: str
     compressed_research: str
     tool_call_iterations: int = 0
@@ -141,7 +139,6 @@ class ResearcherState(TypedDict):
 class ResearcherOutputState(BaseModel):
     """子调研员执行完毕后，回传给主管智能体或全局状态的输出数据结构。"""
 
-    raw_notes: Annotated[list[str], override_reducer] = []
     staged_facts: list[Fact]
     supervisor_messages: list[Any] # 用于将压缩完成的信号转化为 ToolMessage
 
