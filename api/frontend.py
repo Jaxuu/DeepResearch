@@ -39,7 +39,7 @@ ASSISTANT_ID = "Deep Researcher"
 
 def get_new_client():
     """
-    【核心修复】每次调用时创建一个新的客户端实例。
+    每次调用时创建一个新的客户端实例。
     彻底解决 Streamlit 刷新导致的 Event loop is closed 报错问题。
     """
     return get_client(url=LANGGRAPH_URL,headers={"Authorization": "Bearer local-dev-token-123"})
@@ -102,7 +102,7 @@ if "thread_id" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# ================= 侧边栏：真·历史会话管理 =================
+# ================= 侧边栏：历史会话管理 =================
 with st.sidebar:
     st.title("💬 会话历史")
 
@@ -141,51 +141,110 @@ else:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-# ================= 底部固定：输入框 =================
-# ================= 底部固定：输入框 =================
-if prompt := st.chat_input("输入调研需求（如：对比宁德时代与比亚迪最新财报）..."):
+# ================= 状态拦截与恢复控制 =================
+# 检查当前 Thread 是否处于 interrupt 挂起状态
+current_state = None
+if st.session_state.thread_id:
+    client = get_new_client()
+    try:
+        current_state = asyncio.run(client.threads.get_state(st.session_state.thread_id))
+        # 侦测 LangGraph 状态中的 next 节点是否停留在 human_review
+        if current_state and current_state.get("next") and "human_review" in current_state["next"]:
+            st.session_state.pending_interrupt = True
+            tasks = current_state.get("tasks", [])
+            if tasks and tasks[0].get("interrupts"):
+                st.session_state.interrupt_data = tasks[0]["interrupts"][0].get("value", {})
+        else:
+            st.session_state.pending_interrupt = False
+    except Exception as e:
+        pass
 
-    if st.session_state.thread_id is None:
-        short_title = prompt[:12] + "..." if len(prompt) > 12 else prompt
-        new_id = asyncio.run(create_new_thread(title=short_title))
-        st.session_state.thread_id = new_id
+# 渲染干预表单
+if st.session_state.get("pending_interrupt"):
+    st.warning("⏸️ **流程已挂起**：情报检索阶段完成，等待您的审核。")
+    facts = st.session_state.interrupt_data.get("facts", [])
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    with st.expander("📊 查看已收集的事实 (FactBoard)", expanded=True):
+        if not facts:
+            st.info("本次检索未收集到有效事实。")
+        for i, fact in enumerate(facts):
+            st.markdown(
+                f"- **{fact.get('entity', 'N/A')}**: {fact.get('claim', '')} *(来源: {fact.get('source', '')})*")
+
+    feedback = st.text_input("✍️ 补充干预指令（若无需干预请留空）：",
+                             placeholder="例如：请再去核实一下比亚迪 Q3 的出海销量数据...")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✅ 事实无误，直接生成报告", use_container_width=True, type="primary"):
+            st.session_state.resume_payload = {"action": "continue"}
+            st.rerun()
+    with col2:
+        if st.button("🔄 打回节点，继续调研", use_container_width=True):
+            if feedback.strip():
+                st.session_state.resume_payload = {"action": "feedback", "feedback": feedback}
+                st.rerun()
+            else:
+                st.error("打回重做必须填写补充干预指令！")
+
+# ================= 底部固定：输入框 =================
+# 注意此处：如果是触发了 resume 恢复，跳过用户的 chat_input 等待，直接执行
+is_resuming = st.session_state.get("resume_payload") is not None
+prompt = st.chat_input("输入调研需求...") if not is_resuming and not st.session_state.get("pending_interrupt") else None
+
+if prompt or is_resuming:
+    client = get_new_client()
+
+    if prompt and not is_resuming:
+        if st.session_state.thread_id is None:
+            short_title = prompt[:12] + "..." if len(prompt) > 12 else prompt
+            new_id = asyncio.run(create_new_thread(title=short_title))
+            st.session_state.thread_id = new_id
+
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        # 【核心改造 1】引入可折叠的进度指示器 (模拟 DeepSeek 的 <think> 标签)
-        status = st.status("🧠 主控节点已启动，正在规划调研路径...", expanded=True)
+        status_label = "🔄 收到干预指令，正在恢复流转..." if is_resuming else "🧠 主控节点已启动，正在规划调研路径..."
+        status = st.status(status_label, expanded=True)
         message_placeholder = st.empty()
 
 
         async def stream_agent_run():
-            client = get_new_client()
-            payload = {"messages": [{"role": "user", "content": prompt}]}
+            # 判断是新对话还是恢复挂起的执行
+            if is_resuming:
+                payload = st.session_state.resume_payload
+                st.session_state.resume_payload = None
+                st.session_state.pending_interrupt = False
 
-            stream = client.runs.stream(
-                thread_id=st.session_state.thread_id,
-                assistant_id=ASSISTANT_ID,
-                input=payload,
-                stream_mode=["values", "messages"]
-            )
+                # 利用 command 参数向节点注入 resume 信号
+                stream = client.runs.stream(
+                    thread_id=st.session_state.thread_id,
+                    assistant_id=ASSISTANT_ID,
+                    input=None,
+                    command={"resume": payload},
+                    stream_mode=["values", "messages"]
+                )
+            else:
+                payload = {"messages": [{"role": "user", "content": prompt}]}
+                stream = client.runs.stream(
+                    thread_id=st.session_state.thread_id,
+                    assistant_id=ASSISTANT_ID,
+                    input=payload,
+                    stream_mode=["values", "messages"]
+                )
 
             final_report = ""
-            raw_report = ""  # 用于存放包含 <think> 的原始字符串
-            current_streaming_node = ""  # 用于追踪当前是哪个节点在输出
+            raw_report = ""
+            current_streaming_node = ""
             seen_ids = set()
 
             async for chunk in stream:
-                # ==========================================
-                # 通道 A：解析状态流 (折叠面板)
-                # ==========================================
+                # ====== 通道 A：解析状态流 ======
                 if chunk.event == "values":
                     state = chunk.data
-
-                    # 侦测核查器是否发现了幻觉
                     if "verification_feedback" in state and state["verification_feedback"]:
-                        # 确保只播报一次
                         fb_id = str(hash(state["verification_feedback"]))
                         if fb_id not in seen_ids:
                             seen_ids.add(fb_id)
@@ -210,18 +269,27 @@ if prompt := st.chat_input("输入调研需求（如：对比宁德时代与比�
                                         status.write("✅ **情报汇聚**: 子探员完成检索，提炼出结构化事实。")
 
                     if state.get("consecutive_low_gain_rounds", 0) >= 2:
-                        status.write("🛑 **知识饱和**: 剪枝机制触发，停止搜寻，开始成文...")
+                        status.write("🛑 **知识饱和**: 剪枝机制触发，停止搜寻...")
 
-                # ==========================================
-                # 通道 B：解析 Token 流 (正文打字机与覆盖机制)
-                # ==========================================
+                # ====== 通道 B：解析 Token 流 ======
                 elif chunk.event == "messages/partial":
-                    msg_data, metadata = chunk.data
+                    # 1. 兼容性安全解包：动态提取消息体与元数据
+                    if isinstance(chunk.data, list):
+                        msg_data = chunk.data[0] if len(chunk.data) > 0 else {}
+                        metadata = chunk.data[1] if len(chunk.data) > 1 else {}
+                    elif isinstance(chunk.data, dict):
+                        msg_data = chunk.data
+                        metadata = {}
+                    else:
+                        msg_data, metadata = {}, {}
+
+                    # 2. 节点名继承：防止后续 Token 分块丢失 metadata 导致流输出中断
                     node_name = metadata.get("langgraph_node", "")
+                    if not node_name:
+                        node_name = current_streaming_node
 
                     # 仅拦截成文与重写节点的文本流
                     if node_name in ["final_report_generation", "rewrite_report"]:
-
                         # 【核心修复 1】：一旦切换输出节点，立刻清空缓存，实现“重写覆盖”！
                         if current_streaming_node != node_name:
                             current_streaming_node = node_name
@@ -233,7 +301,6 @@ if prompt := st.chat_input("输入调研需求（如：对比宁德时代与比�
                             if status.state == "running":
                                 status.update(label=f"✨ {action}...", state="complete", expanded=False)
                             else:
-                                # 如果之前已经折叠，重新展开提醒用户正在重写
                                 status.update(label=f"✨ {action}...", expanded=False)
 
                         # 安全提取 Token 文本
@@ -253,9 +320,24 @@ if prompt := st.chat_input("输入调研需求（如：对比宁德时代与比�
                             final_report = clean_text.strip()
                             message_placeholder.markdown(final_report + " ▌")
 
+            # ====== 流式结束后的状态结算 ======
             if final_report:
                 message_placeholder.markdown(final_report)
+                status.update(label="✅ 深度调研报告已生成", state="complete", expanded=False)
             else:
-                status.update(label="⚠️ 调研进程被意外中断", state="error", expanded=False)
+                # 检查是否是因为走到 human_review 节点而产生的合法挂起
+                final_state = await client.threads.get_state(st.session_state.thread_id)
+                if final_state and final_state.get("next") and "human_review" in final_state["next"]:
+                    status.update(label="⏸️ 检索已就绪，等待您的审批指令...", state="complete", expanded=False)
+                    st.session_state.pending_interrupt = True
+                else:
+                    status.update(label="⚠️ 调研进程被意外中断", state="error", expanded=False)
 
             return final_report
+
+        # 必须显式调用 async 函数驱动流式请求
+        asyncio.run(stream_agent_run())
+
+        # 如果是刚触发了挂起，立刻强制 Rerun 渲染表单，避免用户手动刷新
+        if st.session_state.get("pending_interrupt"):
+            st.rerun()

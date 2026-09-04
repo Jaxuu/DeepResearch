@@ -14,7 +14,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, Send
+from langgraph.types import Command, Send, interrupt
 
 from open_deep_research.configuration import (
     Configuration,
@@ -355,6 +355,52 @@ async def evaluate_research(state: SupervisorState, config: RunnableConfig) -> C
         update_payload["supervisor_messages"] = [warning_msg]
 
     return Command(goto="supervisor", update=update_payload)
+
+
+async def human_review(state: AgentState, config: RunnableConfig) -> Command[
+    Literal["research_supervisor", "final_report_generation"]]:
+    """人在回路 (HITL) 节点：挂起工作流，等待人类审核事实或追加干预指令。"""
+
+    facts = state.get("structured_facts", [])
+
+    # 兼容 Pydantic v2 (model_dump) 和 v1 (dict)
+    serialized_facts = []
+    for f in facts:
+        if hasattr(f, 'model_dump'):
+            serialized_facts.append(f.model_dump())
+        elif hasattr(f, 'dict'):
+            serialized_facts.append(f.dict())
+        else:
+            serialized_facts.append(f)
+
+    # 触发中断，挂起当前节点。传入的字典会通过 API 暴露给前端
+    user_response = interrupt({
+        "action_required": "review_facts",
+        "facts": serialized_facts
+    })
+
+    # 接收到前端 resume 后的处理逻辑
+    action = user_response.get("action")
+
+    if action == "feedback":
+        feedback_text = user_response.get("feedback", "需要补充更多细节。")
+        print(f"\n[🔄 人类干预] 收到打回指令: {feedback_text}")
+
+        # 构造打回 Command，将干预指令以高优先级系统提示注入 Supervisor 的上下文
+        intervention_msg = HumanMessage(
+            content=f"[HUMAN INTERVENTION] The structured facts were reviewed and rejected. You MUST conduct further research based on this directive: {feedback_text}"
+        )
+        return Command(
+            goto="research_supervisor",
+            update={
+                "supervisor_messages": [intervention_msg],
+                "consecutive_low_gain_rounds": 0  # 重置熔断计数器，防止二次熔断
+            }
+        )
+
+    # 如果 action 是 "continue"，默认放行，进入成文
+    print("\n[✅ 人类干预] 审核通过，进入成文阶段。")
+    return Command(goto="final_report_generation")
 
 
 async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher_tools"]]:
@@ -829,15 +875,15 @@ deep_researcher_builder = StateGraph(
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)           # 用户澄清阶段
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # 研究规划阶段
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # 研究执行阶段
+deep_researcher_builder.add_node("human_review", human_review)
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # 报告生成阶段
 deep_researcher_builder.add_node("report_verifier", report_verifier)                 # 核查节点
 deep_researcher_builder.add_node("rewrite_report", rewrite_report)                 # 重写节点
 
 # 定义主工作流边：顺序执行
 deep_researcher_builder.add_edge(START, "clarify_with_user")                                # 入口点
-deep_researcher_builder.add_edge("research_supervisor", "final_report_generation") # 研究到报告
-deep_researcher_builder.add_edge("final_report_generation", "report_verifier")     # 报告到核查
-
+deep_researcher_builder.add_edge("research_supervisor", "human_review") # 研究到报告
+deep_researcher_builder.add_edge("final_report_generation", "report_verifier") # 报告到核查
 
 # 编译完整的深度研究工作流
 deep_researcher = deep_researcher_builder.compile()
