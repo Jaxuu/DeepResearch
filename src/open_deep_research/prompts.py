@@ -354,9 +354,10 @@ Here is the highly structured Fact Board extracted from the research:
 <Structure Rules>
 - Use ## for section titles (Markdown format).
 - End the report with a specific ### Sources section.
-- In the Sources section, list out the unique URLs/Documents referenced, formatted like:
-  [1] Source: URL
-  [2] Source: URL
+- In the Sources section, list out the unique URLs/Documents referenced. You MUST use a standard Markdown bulleted list, formatted EXACTLY like this:
+  - [1] Source: URL
+  - [2] Source: URL
+  - [3] Source: URL
 - Use corresponding numbers inline, e.g., "The mechanism operates at 500 RPM [1]."
 </Critical Instructions for Writing and Citation>
 """
@@ -409,6 +410,7 @@ Today's date is {date}.
 1. Revise the report to COMPLETELY ELIMINATE all flagged hallucinations and unsupported statements.
 2. If an unsupported claim cannot be grounded using the FactBoard, REMOVE it entirely. Do NOT attempt to paraphrase ungrounded facts.
 3. Fix all misaligned citations to match the ground truth.
-4. Maintain the original structure and keep the exact same language as the human messages history.
+4. Maintain the original structure, keep the exact same language, and ENSURE the Sources section at the bottom remains a cleanly formatted Markdown bulleted list (- [1], - [2], etc.).
 5. Return the revised, fully verified Markdown report.
+</Rewriting Instructions>
 """

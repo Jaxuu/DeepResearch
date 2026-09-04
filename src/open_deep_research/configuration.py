@@ -300,8 +300,8 @@ class Configuration(BaseModel):
 
             # 自动补全规则：若是模型字段且以 qwen 开头，自动拼接 openai: 前缀
             if isinstance(val, str) and "model" in field_name:
-                if val.startswith("qwen") and not val.startswith("openai:"):
-                    val = f"openai:{val}"
+                # if val.startswith("qwen") and not val.startswith("openai:"):
+                val = f"openai:{val}"
 
             values[field_name] = val
 

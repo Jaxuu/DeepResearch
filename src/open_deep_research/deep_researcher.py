@@ -14,7 +14,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, Send
 
 from open_deep_research.configuration import (
     Configuration,
@@ -251,35 +251,31 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     exceeded_allowed_iterations = research_iterations > configurable.max_researcher_iterations
     no_tool_calls = not most_recent_message.tool_calls
     research_complete_tool_call = any(
-        tool_call["name"] == "ResearchComplete"
-        for tool_call in most_recent_message.tool_calls
+        tool_call["name"] == "ResearchComplete" for tool_call in most_recent_message.tool_calls
     )
 
     # 如果满足任一终止条件则退出
     if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
         return Command(
             goto=END,
-            update={
-                "structured_facts": state.get("structured_facts", []),
-                "research_brief": state.get("research_brief", "")
-            }
+            update={"structured_facts": state.get("structured_facts", [])}
         )
 
     # 第2步：同时处理所有工具调用（包括 think_tool 和 ConductResearch）
-    all_tool_messages = []
     update_payload = {"supervisor_messages": []}
+    send_actions = []
 
     # 处理 think_tool 调用（战略反思）
     think_tool_calls = [
         tool_call for tool_call in most_recent_message.tool_calls
-        if tool_call["name"] == "think0_tool"
+        if tool_call["name"] == "think_tool"
     ]
 
     for tool_call in think_tool_calls:
         reflection_content = tool_call["args"]["reflection"]
-        all_tool_messages.append(ToolMessage(
-            content=f"Reflections have been recorded：{reflection_content}",
-            name="think_tool",
+        update_payload["supervisor_messages"].append(ToolMessage(
+            content=f"Reflections recorded: {tool_call['args'].get('reflection', '')}",
+            name=tool_call["name"],
             tool_call_id=tool_call["id"]
         ))
 
@@ -290,136 +286,76 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     ]
 
     if conduct_research_calls:
-        try:
-            # 限制并发研究单元数量，防止资源耗尽
-            allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
-            overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
+        # 限制并发研究单元数量，防止资源耗尽
+        allowed = conduct_research_calls[:configurable.max_concurrent_research_units]
+        overflow = conduct_research_calls[configurable.max_concurrent_research_units:]
 
-            # 并行执行研究任务
-            research_tasks = [
-                researcher_subgraph.ainvoke({
-                    "researcher_messages": [
-                        HumanMessage(content=tool_call["args"]["research_topic"])
-                    ],
-                    "research_topic": tool_call["args"]["research_topic"],
-                    "required_tools": tool_call["args"].get("required_tools", ["tavily_search"])
-                }, config)
-                for tool_call in allowed_conduct_research_calls
-            ]
+        # 生成动态图分支
+        for tool_call in allowed:
+            send_actions.append(Send("researcher_subgraph", {
+                "researcher_messages": [HumanMessage(content=tool_call["args"]["research_topic"])],
+                "research_topic": tool_call["args"]["research_topic"],
+                "required_tools": tool_call["args"].get("required_tools", ["tavily_search"]),
+                "tool_call_id": tool_call["id"]  # 注入溯源 ID
+            }))
 
-            tool_results = await asyncio.gather(*research_tasks)
+        # 处理溢出拒绝
+        for tool_call in overflow:
+            update_payload["supervisor_messages"].append(ToolMessage(
+                content=f"Error: Exceeded max concurrent research units ({configurable.max_concurrent_research_units}).",
+                name="ConductResearch",
+                tool_call_id=tool_call["id"]
+            ))
 
-            # 使用研究结果创建工具消息
-            for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
-                all_tool_messages.append(ToolMessage(
-                    content=observation.get("compressed_research", "Error compressing research report: Exceeded max retries."),
-                    name=tool_call["name"],
-                    tool_call_id=tool_call["id"]
-                ))
+        # 如果有下发的调研任务，图状态流转至评估节点；否则流转回主管
+    if send_actions:
+        return Command(goto=send_actions, update=update_payload)
 
-            # 为超出限制的研究调用返回错误消息
-            for overflow_call in overflow_conduct_research_calls:
-                all_tool_messages.append(ToolMessage(
-                    content=f"Error: Exceeded max concurrent research units ({configurable.max_concurrent_research_units}). Please try submitting with fewer units.",
-                    name="ConductResearch",
-                    tool_call_id=overflow_call["id"]
-                ))
+    return Command(goto="supervisor", update=update_payload)
 
-            # 汇总所有研究结果中的原始笔记
-            raw_notes_concat = "\n".join([
-                "\n".join(observation.get("raw_notes", []))
-                for observation in tool_results
-            ])
+async def evaluate_research(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
+    """在所有子图并发执行完毕后，统一评估收集到的事实，执行剪枝与熔断。"""
+    staged_facts = state.get("staged_facts", [])
+    existing_facts = state.get("structured_facts", [])
+    existing_claims = {getattr(f, 'claim', '') for f in existing_facts}
 
-            if raw_notes_concat:
-                update_payload["raw_notes"] = [raw_notes_concat]
+    new_unique_facts_count = 0
+    for fact in staged_facts:
+        claim = getattr(fact, 'claim', '')
+        if claim and claim not in existing_claims:
+            new_unique_facts_count += 1
+            existing_claims.add(claim)
 
-            # 收集并汇总结构化事实
-            all_structured_facts = []
-            for observation in tool_results:
-                facts = observation.get("structured_facts", [])
-                if facts:
-                    all_structured_facts.extend(facts)
+    low_gain_rounds = state.get("consecutive_low_gain_rounds", 0)
 
-            if all_structured_facts:
-                update_payload["structured_facts"] = all_structured_facts
+    if new_unique_facts_count == 0:
+        low_gain_rounds += 1
+        print(f"\n[✂️ 动态剪枝] 本轮并行检索产生 0 条全新事实。当前连续停滞轮数: {low_gain_rounds}")
+    else:
+        low_gain_rounds = 0
+        print(f"\n[📈 信息增益] 本轮并行新增 {new_unique_facts_count} 条独立高优事实。")
 
-            # 基于信息增益的动态剪枝
-            existing_facts = state.get("structured_facts", [])
-            # 提取已有的所有断言，用于查重
-            existing_claims = {getattr(f, 'claim', '') for f in existing_facts}
+    # 更新结构化事实，并严格清空暂存区，防止脏数据污染下一轮
+    update_payload = {
+        "consecutive_low_gain_rounds": low_gain_rounds,
+        "structured_facts": staged_facts,
+        "staged_facts": {"type": "override", "value": []}
+    }
 
-            new_unique_facts_count = 0
-            for fact in all_structured_facts:
-                claim = getattr(fact, 'claim', '')
-                if claim and claim not in existing_claims:
-                    new_unique_facts_count += 1
-                    existing_claims.add(claim)
+    if low_gain_rounds >= 2:
+        print("\n[🛑 强制熔断] 知识图谱已饱和，提早终止 Supervisor，进入成文阶段。")
+        return Command(goto=END, update=update_payload)
 
-            # 获取当前的连续低增益轮数
-            low_gain_rounds = state.get("consecutive_low_gain_rounds", 0)
+    # 软警告回流
+    if new_unique_facts_count == 0 and low_gain_rounds == 1:
+        print("\n[⚠️ 系统警告] 提醒 Supervisor 改变策略。")
+        warning_msg = HumanMessage(
+            content="[SYSTEM WARNING] Your last concurrent delegation yielded ZERO new unique facts. The search space is saturating. You MUST drastically change your strategy or call 'ResearchComplete'."
+        )
+        update_payload["supervisor_messages"] = [warning_msg]
 
-            if new_unique_facts_count == 0:
-                low_gain_rounds += 1
-                print(f"\n[✂️ 动态剪枝追踪] 本轮检索产生 0 条全新事实。当前连续停滞轮数: {low_gain_rounds}")
-            else:
-                low_gain_rounds = 0  # 只要有新发现，重置计数器
-                print(f"\n[📈 信息增益检测] 本轮新增 {new_unique_facts_count} 条独立高优事实。")
+    return Command(goto="supervisor", update=update_payload)
 
-            update_payload["consecutive_low_gain_rounds"] = low_gain_rounds
-
-            # 触发强制熔断条件（连续 2 轮未获取新事实，或大模型主动停止）
-            if low_gain_rounds >= 2:
-                print("\n[🛑 强制熔断触发] 知识图谱已饱和，提早终止 Supervisor 盲目派发，进入成文阶段。")
-                return Command(
-                    goto=END,
-                    update=update_payload  # 携带最新的状态强制退出
-                )
-
-            # 如果处于低增益状态但还没熔断，给 Supervisor 智能体发一条严重警告
-            if new_unique_facts_count == 0 and low_gain_rounds == 1:
-                print("\n[⚠️ 发送系统警告] 提醒 Supervisor 改变策略或提早结束。")
-                # 安全做法：直接把警告追加到刚刚执行完的最后一个工具调用的返回内容里
-                if all_tool_messages:
-                    all_tool_messages[-1].content += (
-                        "\n\n[SYSTEM WARNING: CRITICAL ALERT]\n"
-                        "Your last delegation yielded ZERO new unique facts. The search space is saturating. "
-                        "You MUST drastically change your search strategy (use completely different keywords) "
-                        "OR call 'ResearchComplete' immediately to avoid wasting resources."
-                    )
-
-        except Exception as e:
-            # 处理研究执行错误
-            if is_token_limit_exceeded(e, configurable.research_model) or True:
-                # Token 超限或其他错误 - 结束研究阶段
-                return Command(
-                    goto=END,
-                    update={
-                        "structured_facts": state.get("structured_facts", []),
-                        "research_brief": state.get("research_brief", "")
-                    }
-                )
-
-    # 第3步：返回包含所有工具结果的 Command
-    update_payload["supervisor_messages"] = all_tool_messages
-    return Command(
-        goto="supervisor",
-        update=update_payload
-    )
-
-# 主管子图构建
-# 创建管理工作委派和协调的研究主管工作流
-supervisor_builder = StateGraph(SupervisorState, config_schema=Configuration)
-
-# 添加研究管理相关的主管节点
-supervisor_builder.add_node("supervisor", supervisor)           # 主管主逻辑
-supervisor_builder.add_node("supervisor_tools", supervisor_tools)  # 工具执行处理器
-
-# 定义主管工作流的边
-supervisor_builder.add_edge(START, "supervisor")  # 主管入口点
-
-# 编译主管子图，供主工作流使用
-supervisor_subgraph = supervisor_builder.compile()
 
 async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher_tools"]]:
     """独立研究员，负责对特定主题进行聚焦研究。
@@ -629,11 +565,15 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                 for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
             ])
 
-            # 返回成功的压缩结果
+            # 返回标准 TypedDict，LangGraph 会自动将其归约到 Supervisor 状态
             return {
                 "raw_notes": [raw_notes_content],
-                "structured_facts": response.facts,
-                "compressed_research": f"Successfully extracted {len(response.facts)} structured facts."
+                "staged_facts": response.facts,
+                "supervisor_messages": [ToolMessage(
+                    content=f"Successfully extracted {len(response.facts)} structured facts.",
+                    name="ConductResearch",
+                    tool_call_id=state.get("tool_call_id", "")
+                )]
             }
 
         except Exception as e:
@@ -655,8 +595,12 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
 
     return {
         "raw_notes": [raw_notes_content],
-        "structured_facts": [],
-        "compressed_research": f"Failed to extract structured facts."
+        "staged_facts": [],
+        "supervisor_messages": [ToolMessage(
+            content="Failed to extract structured facts.",
+            name="ConductResearch",
+            tool_call_id=state.get("tool_call_id", "")
+        )]
     }
 
 # 研究员子图构建
@@ -678,6 +622,25 @@ researcher_builder.add_edge("compress_research", END)      # 压缩后退出
 
 # 编译研究员子图，供主管并行调用
 researcher_subgraph = researcher_builder.compile()
+
+# 主管子图构建
+# 创建管理工作委派和协调的研究主管工作流
+supervisor_builder = StateGraph(SupervisorState, config_schema=Configuration)
+
+# 添加研究管理相关的主管节点
+supervisor_builder.add_node("supervisor", supervisor)           # 主管主逻辑
+supervisor_builder.add_node("supervisor_tools", supervisor_tools)  # 工具执行处理器
+supervisor_builder.add_node("researcher_subgraph", researcher_subgraph)
+supervisor_builder.add_node("evaluate_research", evaluate_research)
+
+# 定义主管工作流的边
+supervisor_builder.add_edge(START, "supervisor")  # 主管入口点
+supervisor_builder.add_edge("researcher_subgraph", "evaluate_research")
+supervisor_builder.add_edge("evaluate_research", "supervisor")
+
+# 编译主管子图，供主工作流使用
+supervisor_subgraph = supervisor_builder.compile()
+
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """生成最终的综合研究报告，带有 token 限制的重试逻辑。
@@ -702,7 +665,6 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         "model": configurable.final_report_model,
         "max_tokens": configurable.final_report_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.final_report_model, config),
-        "tags": ["langsmith:nostream"]
     }
 
     # 第3步：使用 token 限制重试逻辑尝试生成报告
@@ -840,7 +802,6 @@ async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[L
         "model": configurable.rewrite_model,
         "max_tokens": configurable.rewrite_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.rewrite_model, config),
-        "tags": ["langsmith:nostream"]
     }
 
     revised_report = await configurable_model.with_config(writer_model_config).ainvoke([

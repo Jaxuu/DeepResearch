@@ -1,6 +1,6 @@
 """Deep Research 智能体的图状态定义与数据结构。"""
 import operator
-from typing import Annotated, Optional, List, Union
+from typing import Annotated, Optional, List, Union, Any
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
@@ -110,13 +110,11 @@ class AgentState(MessagesState):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: Optional[str]   # 需求澄清后生成的标准调研提纲/简报需求澄清后生成的标准调研提纲/简报
     raw_notes: Annotated[list[str], override_reducer] = []  # 原始调研记录，包含所有子调研员的原始输出
-    structured_facts: Annotated[list[str], override_reducer] = []  # 经过清洗、提炼后的高质量事实笔记
+    structured_facts: Annotated[list[Fact], add_facts_reducer] = []  # 经过清洗、提炼后的高质量事实笔记
     final_report: str   # 最终交付给用户的 Markdown 长文研报
-    # 新增字段
     verification_feedback: Optional[str] = None
     verification_retries: int = 0
-    # 【新增字段】：剪枝追踪器
-    consecutive_low_gain_rounds: int
+    consecutive_low_gain_rounds: int = 0
 
 class SupervisorState(TypedDict):
     """主管智能体（Supervisor）的专用状态，负责管理和派发调研任务。"""
@@ -124,10 +122,10 @@ class SupervisorState(TypedDict):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]   # Supervisor 自身的思考链与工具调用记录，与全局用户的 messages 隔离，避免 Supervisor 的内部决策污染外层对话。
     research_brief: str
     raw_notes: Annotated[list[str], override_reducer] = []
-    structured_facts: Annotated[list[str], override_reducer] = []
+    structured_facts: Annotated[list[Fact], add_facts_reducer] = []
+    staged_facts: Annotated[list[Fact], override_reducer] = []
     research_iterations: int = 0    # 循环安全锁。记录 Supervisor 已经派发了多少轮调研，达到上限时强制终止，防止死循环耗尽 API 额度。
-    # 【新增字段】：剪枝追踪器
-    consecutive_low_gain_rounds: int
+    consecutive_low_gain_rounds: int = 0
 
 class ResearcherState(TypedDict):
     """独立子调研员（Researcher）的私有执行状态。"""
@@ -137,13 +135,13 @@ class ResearcherState(TypedDict):
     research_topic: str
     compressed_research: str
     tool_call_iterations: int = 0
-    required_tools: list[str]  # <--- 新增这行，让打工人合法持有这个属性
-
+    required_tools: list[str]
+    tool_call_id: str
 
 class ResearcherOutputState(BaseModel):
     """子调研员执行完毕后，回传给主管智能体或全局状态的输出数据结构。"""
 
     raw_notes: Annotated[list[str], override_reducer] = []
-    structured_facts: Annotated[list[Fact], add_facts_reducer] = []
-    compressed_research: str
+    staged_facts: list[Fact]
+    supervisor_messages: list[Any] # 用于将压缩完成的信号转化为 ToolMessage
 
