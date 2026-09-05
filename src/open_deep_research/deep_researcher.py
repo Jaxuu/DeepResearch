@@ -24,12 +24,13 @@ from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
     compress_research_system_prompt,
-    final_report_generation_prompt,
     lead_researcher_prompt,
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
     report_verifier_prompt,
-    rewrite_report_prompt
+    rewrite_report_prompt,
+    generate_outline_prompt,
+    write_section_prompt
 )
 from open_deep_research.state import (
     AgentInputState,
@@ -44,6 +45,10 @@ from open_deep_research.state import (
     FactBoard,
     Fact,
     VerificationReport,
+    SectionOutline,
+    ReportOutline,
+    SectionDraft,
+    WriteSectionState
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
@@ -122,9 +127,9 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
 
 
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
-    """将用户消息转换为结构化的研究简报，并初始化主管智能体。
+    """将用户消息转换为结构化的研究概要，并初始化主管智能体。
 
-    此函数分析用户消息，生成一个聚焦的研究简报来指导研究主管，
+    此函数分析用户消息，生成一个聚焦的研究概要来指导研究主管，
     并设置初始的主管上下文，包含适当的提示词和指令。
 
     Args:
@@ -146,7 +151,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     # 配置模型：结构化输出 + 重试逻辑
     research_model = (
         configurable_model
-        .with_structured_output(ResearchQuestion)
+        .with_structured_output(ResearchQuestion,method="json_mode")
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(research_model_config)
     )
@@ -359,7 +364,7 @@ async def evaluate_research(state: SupervisorState, config: RunnableConfig) -> C
 
 
 async def human_review(state: AgentState, config: RunnableConfig) -> Command[
-    Literal["research_supervisor", "final_report_generation"]]:
+    Literal["research_supervisor", "generate_outline"]]:
     """人在回路 (HITL) 节点：挂起工作流，等待人类审核事实或追加干预指令。"""
 
     facts = state.get("structured_facts", [])
@@ -399,9 +404,9 @@ async def human_review(state: AgentState, config: RunnableConfig) -> Command[
             }
         )
 
-    # 如果 action 是 "continue"，默认放行，进入成文
-    print("\n[✅ 人类干预] 审核通过，进入成文阶段。")
-    return Command(goto="final_report_generation")
+    # 如果 action 是 "continue"，默认放行，进入成文阶段
+    print("\n[✅ 人类干预] 审核通过，进入大纲与分层成文阶段。")
+    return Command(goto="generate_outline")
 
 
 async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher_tools"]]:
@@ -690,95 +695,143 @@ supervisor_builder.add_edge("evaluate_research", "supervisor")
 supervisor_subgraph = supervisor_builder.compile()
 
 
-async def final_report_generation(state: AgentState, config: RunnableConfig):
-    """生成最终的综合研究报告，带有 token 限制的重试逻辑。
-
-    此函数接收所有收集的研究发现，并使用配置的报告生成模型
-    将其合成为结构良好、全面的最终报告。
-
-    Args:
-        state: 智能体状态，包含研究发现和上下文
-        config: 运行时配置，包含模型设置和 API 密钥
-
-    Returns:
-        Dictionary: 包含最终报告和清空的状态
-    """
-    # 第1步：提取结构化事实看板数据
-    structured_facts = state.get("structured_facts", [])
-    facts_to_use = structured_facts.copy()  # 用于后续可能的动态截断
-
-    # 第2步：配置最终报告生成模型
+async def generate_outline(state: AgentState, config: RunnableConfig) -> Command[Literal["write_section"]]:
+    """生成大纲并完成数据路由，下发切片后的事实给并发节点。"""
     configurable = Configuration.from_runnable_config(config)
-    writer_model_config = {
+    structured_facts = state.get("structured_facts", [])
+
+    # 极简模式：只给模型看 Entity 和截断的 Claim，并附带明确的 ID (索引)
+    formatted_findings = "\n".join([
+        f"Fact ID [{i}]: Entity: {getattr(f, 'entity', 'Unknown')} | Claim: {str(getattr(f, 'claim', ''))[:100]}..."
+        for i, f in enumerate(structured_facts)
+    ])
+
+    prompt = generate_outline_prompt.format(
+        research_brief=state.get("research_brief", ""),
+        findings=formatted_findings,
+        date=get_today_str()
+    )
+
+    outline_model = configurable_model.with_structured_output(ReportOutline,method="json_mode").with_config({
         "model": configurable.final_report_model,
-        "max_tokens": configurable.final_report_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.final_report_model, config),
-    }
+        "tags": ["langsmith:nostream"]
+    })
 
-    # 第3步：使用 token 限制重试逻辑尝试生成报告
-    max_retries = 3
-    current_retry = 0
-
-    while current_retry <= max_retries:
-        try:
-            # 将 Pydantic 对象列表格式化为高信噪比的纯文本上下文
-            formatted_findings = []
-            for i, fact in enumerate(facts_to_use):
-                # 兼容可能是 dict 或 Pydantic BaseModel 的情况
-                entity = fact.entity if hasattr(fact, 'entity') else fact.get('entity', 'Unknown')
-                claim = fact.claim if hasattr(fact, 'claim') else fact.get('claim', '')
-                source = fact.source if hasattr(fact, 'source') else fact.get('source', '')
-
-                formatted_findings.append(
-                    f"Fact [{i + 1}]:\n"
-                    f" - Entity: {entity}\n"
-                    f" - Claim: {claim}\n"
-                    f" - Source: {source}"
-                )
-
-            findings_text = "\n\n".join(formatted_findings)
-
-            # 创建包含所有研究上下文的综合提示词
-            final_report_prompt = final_report_generation_prompt.format(
-                research_brief=state.get("research_brief", ""),
-                messages=get_buffer_string(state.get("messages", [])),
-                findings=findings_text,
-                date=get_today_str()
+    try:
+        response: ReportOutline = await outline_model.ainvoke([HumanMessage(content=prompt)])
+    except Exception as e:
+        # 极简模式下几乎不会超限，若出错直接走兜底
+        print(f"大纲生成失败，启用兜底: {e}")
+        response = ReportOutline(sections=[
+            SectionOutline(
+                section_title="核心调研发现",
+                description="综合归纳所有搜集到的事实。",
+                relevant_fact_indices=list(range(len(structured_facts)))  # 兜底时全部塞给单一章节
             )
+        ])
 
-            # 生成最终报告
-            final_report = await configurable_model.with_config(writer_model_config).ainvoke([
-                HumanMessage(content=final_report_prompt)
-            ])
+    # 核心拦截器：查找被大模型遗漏的事实 ID（防止幻觉导致数据丢失）
+    assigned_indices = set()
+    for sec in response.sections:
+        assigned_indices.update(sec.relevant_fact_indices)
 
-            # 返回成功的报告生成结果
-            return {
-                "final_report": final_report.content,
-                "messages": [final_report],
-            }
+    unassigned_indices = [i for i in range(len(structured_facts)) if i not in assigned_indices]
 
-        except Exception as e:
-            # 处理 token 超限错误：优雅地丢弃最末尾的 10% 事实，而非截断半句话
-            if is_token_limit_exceeded(e, configurable.final_report_model):
-                current_retry += 1
+    if unassigned_indices:
+        # 如果有被遗漏的事实，自动追加一个“补充发现”章节兜底
+        response.sections.append(SectionOutline(
+            section_title="补充调研发现",
+            description="其他重要的数据与事实补充。",
+            relevant_fact_indices=unassigned_indices
+        ))
 
-                if len(facts_to_use) > 0:
-                    # 每次重试保留前 90% 的事实记录
-                    keep_count = max(1, int(len(facts_to_use) * 0.9))
-                    facts_to_use = facts_to_use[:keep_count]
-                continue
-            else:
-                # 非 token 超限错误：立即返回错误
-                return {
-                    "final_report": f"生成最终报告时出错：{e}",
-                    "messages": [AIMessage(content="因错误导致报告生成失败")]
-                }
+    send_actions = []
+    for sec in response.sections:
+        # 精准切片：只提取当前章节被分配到的事实
+        assigned_facts = []
+        for idx in sec.relevant_fact_indices:
+            if 0 <= idx < len(structured_facts):  # 防止幻觉越界
+                assigned_facts.append(structured_facts[idx])
 
-    # 第4步：如果所有重试都已耗尽
+        # 如果该章节没有分到任何事实，直接跳过不生成
+        if not assigned_facts:
+            continue
+
+        send_actions.append(Send("write_section", {
+            "section_title": sec.section_title,
+            "section_description": sec.description,
+            "assigned_facts": assigned_facts,  # 替换原先的全量 facts
+            "research_brief": state.get("research_brief", "")
+        }))
+
+    return Command(
+        goto=send_actions,
+        update={"report_outline": response.sections,
+                "section_drafts": {"type": "override", "value": []}}
+    )
+
+
+async def write_section(state: WriteSectionState, config: RunnableConfig):
+    """并发写手节点：利用分配到的极少量事实撰写局部章节。"""
+    configurable = Configuration.from_runnable_config(config)
+
+    # 此时 state["assigned_facts"] 通常只有几条到十几条，毫无 Token 压力
+    formatted_findings = "\n".join([
+        # 保留真实 Source 用于打引用标签
+        f"Fact: Entity: {getattr(f, 'entity', '')} | Claim: {getattr(f, 'claim', '')} | Source: {getattr(f, 'source', '')}"
+        for f in state["assigned_facts"]
+    ])
+
+    prompt = write_section_prompt.format(
+        research_brief=state["research_brief"],
+        section_title=state["section_title"],
+        section_description=state["section_description"],
+        findings=formatted_findings,
+        date=get_today_str()
+    )
+
+    writer_model = configurable_model.with_config({
+        "model": configurable.final_report_model,
+        "max_tokens": 4000,
+        "api_key": get_api_key_for_model(configurable.final_report_model, config)
+    })
+
+    section_content = await writer_model.ainvoke([HumanMessage(content=prompt)])
+
     return {
-        "final_report": "生成最终报告时出错：超过最大重试次数，上下文仍然过长。",
-        "messages": [AIMessage(content="超过最大重试次数后报告生成失败")]
+        "section_drafts": [SectionDraft(
+            section_title=state["section_title"],
+            content=section_content.content
+        )]
     }
+
+async def assemble_report(state: AgentState, config: RunnableConfig) -> Command[Literal["report_verifier"]]:
+    """组装节点 (Reduce)：将并发生成的章节按大纲顺序拼合，并生成统一引用。"""
+    outline = state.get("report_outline", [])
+    drafts = state.get("section_drafts", [])
+    structured_facts = state.get("structured_facts", [])
+
+    # 建立草稿字典以实现无序到有序的映射 O(1) 查找
+    draft_map = {draft.section_title: draft.content for draft in drafts}
+
+    # 严格按照大纲顺序拼接
+    assembled_parts = []
+    for sec in outline:
+        content = draft_map.get(sec.section_title, f"## {sec.section_title}\n[该章节内容生成失败]")
+        assembled_parts.append(content)
+
+    # 生成全局统一的参考文献列表
+    sources_section = ["\n\n### 参考文献 (Sources)"]
+    for i, fact in enumerate(structured_facts):
+        sources_section.append(f"- [{i + 1}] Source: {getattr(fact, 'source', 'Unknown')}")
+
+    full_report = "\n\n".join(assembled_parts) + "\n".join(sources_section)
+
+    return Command(
+        goto="report_verifier",
+        update={"final_report": full_report, "messages": [AIMessage(content=full_report)]}
+    )
 
 async def report_verifier(state: AgentState, config: RunnableConfig) -> Command[Literal["rewrite_report", "__end__"]]:
     """核查节点：使用小模型对抗式核验成文报告的引用与断言准确率。"""
@@ -794,13 +847,14 @@ async def report_verifier(state: AgentState, config: RunnableConfig) -> Command[
     ])
 
     # 2. 配置核查模型（选用推理能力强、成本适度的小/中模型）
-    verifier_model = (configurable_model.with_config({
+    verifier_model = (configurable_model
+      .with_structured_output(VerificationReport, method="json_mode")
+      .with_config({
         "model": configurable.verifier_model,
         "max_tokens": configurable.verifier_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.verifier_model, config),
         "tags": ["langsmith:nostream"]
-    }).with_structured_output(VerificationReport, method="function_calling")        # 显式指定使用 function_calling 模式
-      .with_retry(stop_after_attempt=configurable.max_structured_output_retries)    # 挂载重试机制，捕获 Pydantic 解析异常并让 LLM 自动纠正
+    }).with_retry(stop_after_attempt=configurable.max_structured_output_retries)    # 挂载重试机制，捕获 Pydantic 解析异常并让 LLM 自动纠正
     )
 
     prompt = report_verifier_prompt.format(
@@ -850,6 +904,7 @@ async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[L
         "model": configurable.rewrite_model,
         "max_tokens": configurable.rewrite_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.rewrite_model, config),
+        "tags": ["langsmith:nostream"]
     }
 
     revised_report = await configurable_model.with_config(writer_model_config).ainvoke([
@@ -877,15 +932,17 @@ deep_researcher_builder = StateGraph(
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)           # 用户澄清阶段
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # 研究规划阶段
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # 研究执行阶段
-deep_researcher_builder.add_node("human_review", human_review)
-deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # 报告生成阶段
-deep_researcher_builder.add_node("report_verifier", report_verifier)                 # 核查节点
+deep_researcher_builder.add_node("human_review", human_review)                     # HITL审核节点
+deep_researcher_builder.add_node("generate_outline", generate_outline)             # 生成大纲节点
+deep_researcher_builder.add_node("write_section", write_section)                   # 生成章节节点
+deep_researcher_builder.add_node("assemble_report", assemble_report)               # 组装报告节点
+deep_researcher_builder.add_node("report_verifier", report_verifier)               # 核查节点
 deep_researcher_builder.add_node("rewrite_report", rewrite_report)                 # 重写节点
 
 # 定义主工作流边：顺序执行
 deep_researcher_builder.add_edge(START, "clarify_with_user")                                # 入口点
 deep_researcher_builder.add_edge("research_supervisor", "human_review") # 研究到报告
-deep_researcher_builder.add_edge("final_report_generation", "report_verifier") # 报告到核查
+deep_researcher_builder.add_edge("write_section", "assemble_report") # 报告到核查
 
 # 编译完整的深度研究工作流
 deep_researcher = deep_researcher_builder.compile()

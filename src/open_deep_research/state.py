@@ -89,6 +89,20 @@ class VerificationReport(BaseModel):
     hallucinated_claims: List[str] = Field(default_factory=list, description="被判定位幻觉的具体语句列表")
     feedback: str = Field(description="给重写模型的修改指导意见，清晰指出哪一段需要删除或纠正")
 
+class SectionOutline(BaseModel):
+    """大纲的单一章节结构"""
+    section_title: str = Field(description="大纲章节标题")
+    description: str = Field(description="该章节需要覆盖的核心要点、逻辑描述及预期结论")
+    relevant_fact_indices: List[int] = Field(description="分配给该章节的 Fact ID 列表（例如 [0, 3, 12]）。必须覆盖所有提供的事实，不要遗漏。")
+
+class ReportOutline(BaseModel):
+    """生成的全局报告大纲"""
+    sections: List[SectionOutline] = Field(description="报告的章节列表（按正文逻辑顺序排列）")
+
+class SectionDraft(BaseModel):
+    """并发子节点生成的章节草稿"""
+    section_title: str = Field(description="章节标题")
+    content: str = Field(description="章节内容")
 
 
 ###################
@@ -111,10 +125,14 @@ class AgentState(MessagesState):
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: Optional[str]   # 需求澄清后生成的标准调研提纲/简报需求澄清后生成的标准调研提纲/简报
     structured_facts: Annotated[list[Fact], add_facts_reducer] = []  # 经过清洗、提炼后的高质量事实笔记
+    consecutive_low_gain_rounds: int = 0
+
+    report_outline: Optional[List[SectionOutline]] = None
+    section_drafts: Annotated[list[SectionDraft], override_reducer] = []
     final_report: str   # 最终交付给用户的 Markdown 长文研报
+
     verification_feedback: Optional[str] = None
     verification_retries: int = 0
-    consecutive_low_gain_rounds: int = 0
 
 class SupervisorState(TypedDict):
     """主管智能体（Supervisor）的专用状态，负责管理和派发调研任务。"""
@@ -125,6 +143,13 @@ class SupervisorState(TypedDict):
     staged_facts: Annotated[list[Fact], override_reducer] = []  # 暂存最新的事实列表，用来和structured_facts对比实现熔断
     research_iterations: int = 0    # 循环安全锁。记录 Supervisor 已经派发了多少轮调研，达到上限时强制终止，防止死循环耗尽 API 额度。
     consecutive_low_gain_rounds: int = 0
+
+class WriteSectionState(TypedDict):
+    """并发写手节点的独立状态"""
+    section_title: str
+    section_description: str
+    assigned_facts: list[Fact]
+    research_brief: str
 
 class ResearcherState(TypedDict):
     """独立子调研员（Researcher）的私有执行状态。"""

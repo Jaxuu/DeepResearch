@@ -81,6 +81,7 @@ Guidelines:
 
 Respond in valid JSON format with the research_brief field.
 IMPORTANT: The research_brief MUST be written in the exact same language as the user's input messages.
+IMPORTANT: You MUST return your response in valid JSON format.
 """
 
 lead_researcher_prompt = """
@@ -326,40 +327,54 @@ All above messages are about research conducted by an AI Researcher. Please clea
 DO NOT summarize the information. I want the raw information returned, just in a cleaner format. Make sure all relevant information is preserved - you can rewrite findings verbatim.
 """
 
-final_report_generation_prompt = """
-Based on all the structured research facts gathered, create a comprehensive, well-structured answer to the overall research brief:
+generate_outline_prompt = """
+You are an expert Chief Editor. Your task is to design a highly logical, comprehensive Markdown outline for a research report based on the provided facts.
+
+Today's date is {date}.
 
 <Research Brief>
 {research_brief}
 </Research Brief>
 
-<Messages>
-{messages}
-</Messages>
-
-Today's date is {date}.
-
-Here is the highly structured Fact Board extracted from the research:
 <FactBoard>
 {findings}
 </FactBoard>
 
-<Critical Instructions for Writing and Citation>
-1. Synthesize the Information: Do not just list the facts. Weave the Entities and Claims from the <FactBoard> into a cohesive, professional narrative that directly answers the Research Brief.
-2. Absolute Faithfulness: You must ONLY use the claims provided in the <FactBoard>. Do NOT hallucinate data, invent events, or mix up Entities.
-3. Strict Citation Matching: Every time you make a statement based on a fact, you MUST append an inline citation linking directly to its original `Source`. 
-   - Never attribute a claim to a source that wasn't explicitly linked to it in the <FactBoard>.
-4. Language Requirement: CRITICAL! Make sure the answer is written in the SAME language as the human messages history!
+<Instructions>
+1. Create a comprehensive outline divided into distinct sections. Do NOT include a "Sources" or "References" section.
+2. For EACH section, you MUST assign the relevant facts by listing their ID numbers in the `relevant_fact_indices` array.
+3. EXHAUSTIVE ASSIGNMENT: Every single Fact ID provided in the <FactBoard> MUST be assigned to at least one section. Do not leave any facts behind.
+4. If a fact is relevant to multiple sections, you can include its ID in multiple sections.
+5. IMPORTANT: You MUST return your response in valid JSON format.
+</Instructions>
+"""
 
-<Structure Rules>
-- Use ## for section titles (Markdown format).
-- End the report with a specific ### Sources section.
-- In the Sources section, list out the unique URLs/Documents referenced. You MUST use a standard Markdown bulleted list, formatted EXACTLY like this:
-  - [1] Source: URL
-  - [2] Source: URL
-  - [3] Source: URL
-- Use corresponding numbers inline, e.g., "The mechanism operates at 500 RPM [1]."
-</Critical Instructions for Writing and Citation>
+write_section_prompt = """
+You are an expert Technical Writer. Your task is to write ONE specific section of a larger research report.
+
+Today's date is {date}.
+
+<Overall Research Brief>
+{research_brief}
+</Overall Research Brief>
+
+<Your Assigned Section>
+Title: {section_title}
+Requirements: {section_description}
+</Your Assigned Section>
+
+<Available Facts>
+{findings}
+</Available Facts>
+
+<Instructions>
+1. Write ONLY the content for your assigned section. Do NOT write an introduction or conclusion unless specified in your requirements.
+2. Start your response directly with the section heading: `## {section_title}`
+3. Synthesize the facts into professional prose. DO NOT just list them.
+4. ABSOLUTE FAITHFULNESS: You must ONLY use the claims provided in the <Available Facts>. Do not hallucinate.
+5. STRICT CITATION: Every factual claim MUST be followed by its source index (e.g., [1], [5]).
+6. Write in the EXACT SAME language as the Overall Research Brief.
+</Instructions>
 """
 
 report_verifier_prompt = """
@@ -382,11 +397,18 @@ Today's date is {date}.
 3. Ground-Truth Alignment: For every claim, does the source corresponding to its citation actually exist in the <Ground-Truth FactBoard> and fully verify the statement? Detect entity contamination (e.g., claiming a venue held a sport it never hosted).
 4. Aggregation: If ANY claim fails the check (missing from FactBoard, wrong citation number, invented facts), you MUST set `has_hallucinations` to true, append the bad claim to `hallucinated_claims`, and give a proportionally low `citation_precision_score` (e.g., Supported Claims / Total Claims).
 
-CRITICAL FORMATTING RULES:
+CRITICAL FORMATTING RULES (FAILURE TO FOLLOW WILL CRASH THE SYSTEM):
 - You MUST respond strictly using the provided JSON schema function.
 - DO NOT wrap your response in an 'audit_report' key or any other root keys.
 - Output the flat JSON object directly with EXACTLY these keys: "detailed_checks", "has_hallucinations", "citation_precision_score", "hallucinated_claims", "feedback".
 </Verification Directives>
+- The `detailed_checks` array MUST contain JSON OBJECTS, NEVER plain strings. Each item in the array MUST EXACTLY match this dictionary structure:
+  {{
+    "claim": "The exact sentence from the report",
+    "citation_index": [1], 
+    "is_supported": true,
+    "reason": "Explanation of why it is supported or hallucinated"
+  }}
 """
 
 rewrite_report_prompt = """
