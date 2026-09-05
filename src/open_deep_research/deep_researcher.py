@@ -30,7 +30,8 @@ from open_deep_research.prompts import (
     report_verifier_prompt,
     rewrite_report_prompt,
     generate_outline_prompt,
-    write_section_prompt
+    write_section_prompt,
+    memory_folding_prompt
 )
 from open_deep_research.state import (
     AgentInputState,
@@ -360,8 +361,70 @@ async def evaluate_research(state: SupervisorState, config: RunnableConfig) -> C
         )
         update_payload["supervisor_messages"] = [warning_msg]
 
-    return Command(goto="supervisor", update=update_payload)
+    return Command(goto="fold_memory", update=update_payload)
 
+async def fold_memory(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor"]]:
+    """折叠主管的历史记忆，防止 Token 爆炸。"""
+    messages = state.get("supervisor_messages", [])
+
+    # 设定阈值：当消息数量超过 10 条（初始2条 + 至少4轮交互）时触发折叠
+    if len(messages) <= 10:
+        return Command(goto="supervisor")
+
+    # 核心安全逻辑：寻找最后一个 AIMessage 的索引
+    # 必须保留最后一次决策及其对应的 ToolMessage，防止破坏 LangGraph 的工具校验
+    last_ai_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], AIMessage):
+            last_ai_idx = i
+            break
+
+    # 如果历史太短，或者找不到分割点，则放弃折叠
+    if last_ai_idx <= 2:
+        return Command(goto="supervisor")
+
+    # 截取需要被压缩的中间历史
+    # messages[0] 和 [1] 是初始的 SystemMessage 和 HumanMessage
+    history_to_fold = messages[2:last_ai_idx]
+    retained_latest = messages[last_ai_idx:]
+
+    history_str = get_buffer_string(history_to_fold)
+
+    configurable = Configuration.from_runnable_config(config)
+    # 调用价格低廉/速度快的压缩模型（例如 GPT-4o-mini 或同等模型）
+    model_config = {
+        "model": configurable.compression_model,
+        "max_tokens": configurable.compression_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.compression_model, config),
+        "tags": ["langsmith:nostream"]
+    }
+
+    model = configurable_model.with_config(model_config)
+    prompt = memory_folding_prompt.format(history=history_str)
+
+    # 执行压缩
+    try:
+        summary_msg = await model.ainvoke([HumanMessage(content=prompt)])
+        folded_memory_text = summary_msg.content
+    except Exception as e:
+        print(f"\n[⚠️ 记忆折叠失败] 跳过本次压缩: {e}")
+        return Command(goto="supervisor")
+
+    # 构造新的记忆胶囊
+    folded_memory = SystemMessage(
+        content=f"[SYSTEM: LONG-TERM MEMORY FROM PREVIOUS STEPS]\n{folded_memory_text}"
+    )
+
+    # 拼接全新的状态（初始设定 + 浓缩记忆 + 当前执行现场）
+    new_messages = messages[:2] + [folded_memory] + retained_latest
+
+    print(f"\n[🧠 记忆折叠] 主管上下文已压缩，消息数: {len(messages)} -> {len(new_messages)}")
+
+    # 利用 override_reducer 直接覆写 Supervisor 的消息流
+    return Command(
+        goto="supervisor",
+        update={"supervisor_messages": {"type": "override", "value": new_messages}}
+    )
 
 async def human_review(state: AgentState, config: RunnableConfig) -> Command[
     Literal["research_supervisor", "generate_outline"]]:
@@ -676,6 +739,7 @@ researcher_builder.add_edge("compress_research", END)      # 压缩后退出
 # 编译研究员子图，供主管并行调用
 researcher_subgraph = researcher_builder.compile()
 
+
 # 主管子图构建
 # 创建管理工作委派和协调的研究主管工作流
 supervisor_builder = StateGraph(SupervisorState, config_schema=Configuration)
@@ -685,11 +749,11 @@ supervisor_builder.add_node("supervisor", supervisor)           # 主管主逻�
 supervisor_builder.add_node("supervisor_tools", supervisor_tools)  # 工具执行处理器
 supervisor_builder.add_node("researcher_subgraph", researcher_subgraph)
 supervisor_builder.add_node("evaluate_research", evaluate_research)
+supervisor_builder.add_node("fold_memory", fold_memory)
 
 # 定义主管工作流的边
 supervisor_builder.add_edge(START, "supervisor")  # 主管入口点
 supervisor_builder.add_edge("researcher_subgraph", "evaluate_research")
-supervisor_builder.add_edge("evaluate_research", "supervisor")
 
 # 编译主管子图，供主工作流使用
 supervisor_subgraph = supervisor_builder.compile()

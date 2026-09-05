@@ -229,6 +229,21 @@ After each search tool call, use think_tool to analyze the results:
 </Show Your Thinking>
 """
 
+memory_folding_prompt = """
+You are an expert Research Strategist. Your task is to compress the past trajectory of a research supervisor into a highly dense "Long-Term Memory" summary.
+
+<Past Actions & Results>
+{history}
+</Past Actions & Results>
+
+<Instructions>
+1. Summarize the previously explored search paths (e.g., "Searched for X, found Y").
+2. Identify "dead ends" or exhausted paths that should NOT be searched again.
+3. Keep it extremely concise, acting as a strategic memo to prevent redundant searches.
+4. Do NOT include greetings or meta-commentary.
+</Instructions>
+"""
+
 summarize_webpage_prompt: str = """
 You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
 
