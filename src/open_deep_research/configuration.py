@@ -164,26 +164,6 @@ class Configuration(BaseModel):
             }
         }
     )
-    summarization_model: str = Field(
-        default=os.getenv("SUMMARIZATION_MODEL"),
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": os.getenv("SUMMARIZATION_MODEL"),
-                "description": "Model for summarizing research results from Tavily search results"
-            }
-        }
-    )
-    summarization_model_max_tokens: int = Field(
-        default=8192,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 8192,
-                "description": "Maximum output tokens for summarization model"
-            }
-        }
-    )
     compression_model: str = Field(
         default=os.getenv("COMPRESSION_MODEL"),
         metadata={
@@ -195,7 +175,7 @@ class Configuration(BaseModel):
         }
     )
     compression_model_max_tokens: int = Field(
-        default=10000,
+        default=8192,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
@@ -215,11 +195,11 @@ class Configuration(BaseModel):
         }
     )
     final_report_model_max_tokens: int = Field(
-        default=12000,
+        default=8192,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 10000,
+                "default": 8192,
                 "description": "Maximum output tokens for final report model"
             }
         }
@@ -235,11 +215,11 @@ class Configuration(BaseModel):
         }
     )
     verifier_model_max_tokens: int = Field(
-        default=10000,
+        default=4000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 10000,
+                "default": 4000,
                 "description": "Maximum output tokens for verifier model"
             }
         }
@@ -255,11 +235,11 @@ class Configuration(BaseModel):
         }
     )
     rewrite_model_max_tokens: int = Field(
-        default=10000,
+        default=8192,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 10000,
+                "default": 8192,
                 "description": "Maximum output tokens for verifier model"
             }
         }

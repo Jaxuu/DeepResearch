@@ -1,6 +1,7 @@
 """Deep Research 智能体的 LangGraph 主实现。"""
 
 import asyncio
+import json
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
@@ -56,7 +57,6 @@ from open_deep_research.utils import (
     get_all_tools,
     get_api_key_for_model,
     get_model_token_limit,
-    get_notes_from_tool_calls,
     get_today_str,
     is_token_limit_exceeded,
     openai_websearch_called,
@@ -302,7 +302,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             send_actions.append(Send("researcher_subgraph", {
                 "researcher_messages": [HumanMessage(content=tool_call["args"]["research_topic"])],
                 "research_topic": tool_call["args"]["research_topic"],
-                "required_tools": tool_call["args"].get("required_tools", ["tavily_search"]),
+                "required_tools": tool_call["args"].get("required_tools", ["web_search", "fetch_webpage"]),
                 "tool_call_id": tool_call["id"]  # 注入溯源 ID
             }))
 
@@ -442,35 +442,46 @@ async def human_review(state: AgentState, config: RunnableConfig) -> Command[
         else:
             serialized_facts.append(f)
 
-    # 触发中断，挂起当前节点。传入的字典会通过 API 暴露给前端
+    # 触发中断，挂起当前节点。给前端/API返回明确的提示信息
     user_response = interrupt({
         "action_required": "review_facts",
+        "message": "请审核收集到的事实。如有意见请输入修改指令并返回；若满意，请直接留空返回。",
         "facts": serialized_facts
     })
 
-    # 接收到前端 resume 后的处理逻辑
-    action = user_response.get("action")
+    feedback_text = ""
 
-    if action == "feedback":
-        feedback_text = user_response.get("feedback", "需要补充更多细节。")
-        print(f"\n[🔄 人类干预] 收到打回指令: {feedback_text}")
+    if isinstance(user_response, str):
+        feedback_text = user_response.strip()
+        # 兼容旧版序列化 JSON
+        if feedback_text.startswith("{") and feedback_text.endswith("}"):
+            try:
+                parsed = json.loads(feedback_text)
+                feedback_text = parsed.get("feedback", "").strip() if parsed.get("action") == "feedback" else ""
+            except:
+                pass
+    elif isinstance(user_response, dict):
+        feedback_text = user_response.get("feedback", "").strip() if user_response.get("action") == "feedback" else ""
+    elif user_response is not None:
+        feedback_text = str(user_response).strip()
 
-        # 构造打回 Command，将干预指令以高优先级系统提示注入 Supervisor 的上下文
-        intervention_msg = HumanMessage(
-            content=f"[HUMAN INTERVENTION] The structured facts were reviewed and rejected. You MUST conduct further research based on this directive: {feedback_text}"
-        )
-        return Command(
-            goto="research_supervisor",
-            update={
-                "supervisor_messages": [intervention_msg],
-                "consecutive_low_gain_rounds": 0  # 重置熔断计数器，防止二次熔断
-            }
-        )
+    if not feedback_text:
+        # 如果 feedback_text 为空字符串，说明用户没有输入意见，直接放行
+        print("\n[✅ 人类干预] 审核通过，进入大纲与分层成文阶段。")
+        return Command(goto="generate_outline")
 
-    # 如果 action 是 "continue"，默认放行，进入成文阶段
-    print("\n[✅ 人类干预] 审核通过，进入大纲与分层成文阶段。")
-    return Command(goto="generate_outline")
-
+        # 如果有内容，说明用户不满意，将输入内容作为指令打回
+    print(f"\n[🔄 人类干预] 收到打回指令: {feedback_text}")
+    intervention_msg = HumanMessage(
+        content=f"[HUMAN INTERVENTION] The structured facts were reviewed and rejected. You MUST conduct further research based on this directive: {feedback_text}"
+    )
+    return Command(
+        goto="research_supervisor",
+        update={
+            "supervisor_messages": [intervention_msg],
+            "consecutive_low_gain_rounds": 0  # 重置熔断计数器，防止二次熔断
+        }
+    )
 
 async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher_tools"]]:
     """独立研究员，负责对特定主题进行聚焦研究。
@@ -497,7 +508,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         )
 
     # 精准挂载分配的技能
-    allowed_tool_names = state.get("required_tools", ["tavily_search"])
+    allowed_tool_names = state.get("required_tools", ["web_search", "fetch_webpage"])
     active_tools = []
 
     for tool in tools:

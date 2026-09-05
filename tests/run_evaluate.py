@@ -20,8 +20,6 @@ max_concurrent_research_units = 10
 search_api = "tavily" # NOTE: We use Tavily to stay consistent
 max_researcher_iterations = 6
 max_react_tool_calls = 10
-summarization_model = "openai:gpt-4.1-mini"
-summarization_model_max_tokens = 8192
 research_model = "openai:gpt-5" # "anthropic:claude-sonnet-4-20250514"
 research_model_max_tokens = 10000
 compression_model = "openai:gpt-4.1"
@@ -45,8 +43,6 @@ async def target(
     config["configurable"]["search_api"] = search_api
     config["configurable"]["max_researcher_iterations"] = max_researcher_iterations
     config["configurable"]["max_react_tool_calls"] = max_react_tool_calls
-    config["configurable"]["summarization_model"] = summarization_model
-    config["configurable"]["summarization_model_max_tokens"] = summarization_model_max_tokens
     config["configurable"]["research_model"] = research_model
     config["configurable"]["research_model_max_tokens"] = research_model_max_tokens
     config["configurable"]["compression_model"] = compression_model
@@ -74,8 +70,6 @@ async def main():
             "search_api": search_api,
             "max_researcher_iterations": max_researcher_iterations,
             "max_react_tool_calls": max_react_tool_calls,
-            "summarization_model": summarization_model,
-            "summarization_model_max_tokens": summarization_model_max_tokens,
             "research_model": research_model,
             "research_model_max_tokens": research_model_max_tokens,
             "compression_model": compression_model,

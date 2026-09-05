@@ -39,19 +39,12 @@ class ConductResearch(BaseModel):
     )
     # 【新增】：技能清单，带上备选工具的枚举说明
     required_tools: List[str] = Field(
-        description="The specific tools this agent should have access to. Options: 'tavily_search', 'search_equipment_knowledge', 'query_erp_database'",
-        default=["tavily_search"]
+        description="The specific tools this agent should have access to. Options: 'web_search', 'fetch_webpage', 'search_equipment_knowledge', 'query_erp_database'",
+        default=["web_search", "fetch_webpage"]
     )
 
 class ResearchComplete(BaseModel):
     """调用此工具表示所有调研工作已完成。"""
-
-class Summary(BaseModel):
-    """包含核心发现的调研总结。"""
-
-    summary: str
-    key_excerpts: str
-
 
 class Fact(BaseModel):
     """从检索内容中提纯的最小知识单元"""

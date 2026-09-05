@@ -3,10 +3,10 @@
 import asyncio
 import logging
 import os
+import httpx
 import warnings
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
-import aiohttp
 from contextlib import AsyncExitStack
 
 from tavily import AsyncTavilyClient
@@ -30,200 +30,83 @@ from langchain_core.tools import (
     tool,
 )
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.tools import load_mcp_tools as load_langchain_mcp_tools
 
 from open_deep_research.configuration import Configuration, SearchAPI
-from open_deep_research.prompts import summarize_webpage_prompt
-from open_deep_research.state import ResearchComplete, Summary
+from open_deep_research.state import ResearchComplete
 
 ##########################
 # Tavily 搜索工具组件
 ##########################
-TAVILY_SEARCH_DESCRIPTION = (
-    "A search engine optimized for comprehensive, accurate, and trusted results. "
-    "Useful for when you need to answer questions about current events."
-)
-@tool(description=TAVILY_SEARCH_DESCRIPTION)
-async def tavily_search(
-    queries: List[str],
-    max_results: Annotated[int, InjectedToolArg] = 5,
-    topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
-    config: RunnableConfig = None
+@tool(description="Search the web for news, facts, and public data. Returns titles, URLs, and concise snippets.")
+async def web_search(
+        queries: List[str],
+        max_results: Annotated[int, InjectedToolArg] = 5,
+        topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
+        config: RunnableConfig = None
 ) -> str:
-    """Fetch and summarize search results from Tavily search API.
+    """仅检索网页元数据与摘要片段，不下载全文。"""
+    tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
 
-    Args:
-        queries: List of search queries to execute
-        max_results: Maximum number of results to return per query
-        topic: Topic filter for search results (general, news, or finance)
-        config: Runtime configuration for API keys and model settings
+    search_tasks = [
+        tavily_client.search(
+            query,
+            max_results=max_results,
+            include_raw_content=False,  # 关闭全量下载
+            topic=topic
+        )
+        for query in queries
+    ]
+    search_results = await asyncio.gather(*search_tasks)
 
-    Returns:
-        Formatted string containing summarized search results
-    """
-    # 步骤 1：异步执行搜索查询
-    search_results = await tavily_search_async(
-        queries,
-        max_results=max_results,
-        topic=topic,
-        include_raw_content=True,
-        config=config
-    )
-
-    # 步骤 2：按 URL 进行去重，避免重复处理相同内容
+    # 简单去重
     unique_results = {}
     for response in search_results:
         for result in response['results']:
             url = result['url']
             if url not in unique_results:
-                unique_results[url] = {**result, "query": response['query']}
+                unique_results[url] = result
 
-    # 步骤 3：根据配置初始化摘要模型
-    configurable = Configuration.from_runnable_config(config)
+    if not unique_results:
+        return "No valid search results found."
 
-    # 字符数限制以保持在模型 Token 限制内（可配置）
-    max_char_to_include = configurable.max_content_length
-
-    # 初始化带重试逻辑的摘要模型
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
-        model=configurable.summarization_model,
-        max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
-        tags=["langsmith:nostream"]
-    ).with_structured_output(Summary, method="function_calling").with_retry(
-        stop_after_attempt=configurable.max_structured_output_retries
-    )
-
-    # 步骤 4：创建摘要任务（跳过空内容）
-    async def noop():
-        """针对无原始正文结果的空操作函数。"""
-        return None
-
-    summarization_tasks = [
-        noop() if not result.get("raw_content")
-        else summarize_webpage(
-            summarization_model,
-            result['raw_content'][:max_char_to_include]
-        )
-        for result in unique_results.values()
-    ]
-
-    # 步骤 5：并行执行所有摘要任务
-    summaries = await asyncio.gather(*summarization_tasks)
-
-    # 步骤 6：将搜索结果与生成的摘要进行合并
-    summarized_results = {
-        url: {
-            'title': result['title'],
-            'content': result['content'] if summary is None else summary
-        }
-        for url, result, summary in zip(
-            unique_results.keys(),
-            unique_results.values(),
-            summaries
-        )
-    }
-
-    # 步骤 7：格式化最终输出
-    if not summarized_results:
-        return "No valid search results found. Please try different search queries or use a different search API."
-
-    formatted_output = "Search results: \n\n"
-    for i, (url, result) in enumerate(summarized_results.items()):
-        formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
-        formatted_output += f"URL: {url}\n\n"
-        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
-        formatted_output += "\n\n" + "-" * 80 + "\n"
-
-    # 增加单次 ToolMessage 输出总长度防御性截断（最多保留 25000 字符，约 7000 tokens）
-    MAX_TOOL_OUTPUT_CHARS = 25000
-    if len(formatted_output) > MAX_TOOL_OUTPUT_CHARS:
-        formatted_output = formatted_output[:MAX_TOOL_OUTPUT_CHARS] + "\n\n[...搜索结果总量达到上限，已安全截断...]"
+    formatted_output = "Search Results (Snippets only):\n\n"
+    for i, (url, res) in enumerate(unique_results.items()):
+        formatted_output += f"[{i + 1}] Title: {res.get('title', 'N/A')}\n"
+        formatted_output += f"    URL: {url}\n"
+        formatted_output += f"    Snippet: {res.get('content', '')}\n\n"
 
     return formatted_output
 
-async def tavily_search_async(
-    search_queries,
-    max_results: int = 5,
-    topic: Literal["general", "news", "finance"] = "general",
-    include_raw_content: bool = True,
-    config: RunnableConfig = None
-):
-    """异步并发执行多个 Tavily 搜索查询。
 
-    参数:
-        search_queries: 待执行的搜索查询字符串列表
-        max_results: 每个查询返回的最大结果数
-        topic: 过滤结果的主题类别
-        include_raw_content: 是否包含完整的网页原始正文
-        config: 用于获取 API 密钥的运行时配置
+@tool(
+    description="Fetch and parse the full text of a specific URL into clean Markdown. Use this when snippets are insufficient.")
+async def fetch_webpage(url: str) -> str:
+    """使用远端 Jina Reader 服务直接提取网页正文 Markdown。"""
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "X-Timeout": "15"  # 15秒超时设置
+    }
 
-    返回:
-        来自 Tavily API 的搜索结果字典列表
-    """
-    # 使用来自配置的 API 密钥初始化 Tavily 客户端
-    tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
+    # 若在环境变量中配置了 JINA_API_KEY，则自动携带；没有配置也能直接免密访问
+    jina_key = os.getenv("JINA_API_KEY")
+    if jina_key:
+        headers["Authorization"] = f"Bearer {jina_key}"
 
-    # 创建用于并行执行的搜索任务
-    search_tasks = [
-        tavily_client.search(
-            query,
-            max_results=max_results,
-            include_raw_content=include_raw_content,
-            topic=topic
-        )
-        for query in search_queries
-    ]
-
-    # 并行执行所有搜索查询并返回结果
-    search_results = await asyncio.gather(*search_tasks)
-    return search_results
-
-async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
-    """使用 AI 模型对网页正文进行摘要，并带有超时保护。
-
-    参数:
-        model: 配置好的用于生成摘要的 Chat 模型
-        webpage_content: 待摘要的网页原始正文
-
-    返回:
-        格式化后的包含核心摘录的摘要，若摘要失败则返回截断后的原始内容
-    """
     try:
-        # 创建包含当前日期上下文的提示词
-        prompt_content = summarize_webpage_prompt.format(
-            webpage_content=webpage_content,
-            date=get_today_str()
-        )
-
-        # 执行带超时的摘要生成，防止任务挂起
-        summary = await asyncio.wait_for(
-            model.ainvoke([HumanMessage(content=prompt_content)]),
-            timeout=60.0  # 摘要生成设置 60 秒超时
-        )
-
-        # 将摘要格式化为结构化区块
-        formatted_summary = (
-            f"<summary>\n{summary.summary}\n</summary>\n\n"
-            f"<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"
-        )
-
-        return formatted_summary
-
-
-    except asyncio.TimeoutError:
-        # 摘要生成超时 - 返回截断后的原始内容
-        logging.warning("Summarization timed out after 60 seconds, returning original content limit 1500 characters")
-        return webpage_content[:1500]
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            response = await client.get(jina_url, headers=headers)
+            if response.status_code == 200:
+                content = response.text
+                # 安全截断，防止目标网页过长（保留约 15000 字符，足够提取长篇专业数据）
+                if len(content) > 15000:
+                    content = content[:15000] + "\n\n[...正文超长，已安全截断...]"
+                return content
+            else:
+                return f"Failed to fetch content from {url}. Status code: {response.status_code}"
     except Exception as e:
-        # 摘要生成遇到其他错误 - 记录日志并返回截断后的原始内容
-        logging.warning(f"Summarization failed with error: {str(e)}, returning original content limit 1500 characters")
-        return webpage_content[:1500]
+        return f"Error reading URL {url}: {str(e)}"
 
-##########################
-# 策略反思工具组件
-##########################
 
 @tool(description="Strategic reflection tool for research planning")
 def think_tool(reflection: str) -> str:
@@ -330,7 +213,7 @@ async def get_search_tool(search_api: SearchAPI):
 
     elif search_api == SearchAPI.TAVILY:
         # 配置带元数据的 Tavily 搜索工具
-        search_tool = tavily_search
+        search_tool = web_search
         search_tool.metadata = {
             **(search_tool.metadata or {}),
             "type": "search",
@@ -360,8 +243,14 @@ async def get_all_tools(config: RunnableConfig):
     # 添加配置的搜索工具
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
-    search_tools = await get_search_tool(search_api)
-    tools.extend(search_tools)
+
+    # 若选择 Tavily，则挂载新改造的 web_search
+    if search_api == SearchAPI.TAVILY:
+        tools.append(web_search)
+        tools.append(fetch_webpage)
+    else:
+        search_tools = await get_search_tool(search_api)
+        tools.extend(search_tools)
 
     # 记录已有工具名称以防冲突
     existing_tool_names = {
@@ -369,15 +258,11 @@ async def get_all_tools(config: RunnableConfig):
         for tool in tools
     }
 
-    # 若有配置则添加 MCP 工具
-    mcp_tools = await load_mcp_tools(config, existing_tool_names)
-    tools.extend(mcp_tools)
+    # # 若有配置则添加 MCP 工具
+    # mcp_tools = await load_mcp_tools(config, existing_tool_names)
+    # tools.extend(mcp_tools)
 
     return tools
-
-def get_notes_from_tool_calls(messages: list[MessageLikeRepresentation]):
-    """从工具调用消息中提取笔记内容。"""
-    return [tool_msg.content for tool_msg in filter_messages(messages, include_types="tool")]
 
 ##########################
 # 模型供应商原生网络搜索组件

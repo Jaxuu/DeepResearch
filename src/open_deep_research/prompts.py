@@ -102,22 +102,18 @@ You have access to three main tools:
 </Available Tools>
 
 <Dynamic Tool Allocation (CRITICAL)>
-When calling `ConductResearch`, you MUST assign ONLY the necessary tools using the `required_tools` field. Do not overload sub-agents with unused tools.
+When calling `ConductResearch`, you MUST assign ONLY the necessary tools using the `required_tools` field based strictly on the DOMAIN of the query.
 
 Available Tool Options:
-- `tavily_search`: For external internet search (e-commerce, news, competitors).
-- `search_equipment_knowledge`: For internal technical manuals, parameters, or unstructured specs (RAG).
-- `query_erp_database`: For structured internal data like warehouse stock, inventory quantities, and exact ERP prices.
-
-You can assign multiple tools if a specific sub-topic requires cross-referencing, but prefer 1-2 tools maximum per agent.
+- `web_search` & `fetch_webpage`: For general knowledge, history, culture, news, external market data, and public internet searches. (ALWAYS assign these TWO together).
+- `search_equipment_knowledge`: ONLY for internal technical manuals, industrial parameters, or unstructured equipment specs.
+- `query_erp_database`: ONLY for structured internal data like warehouse stock, inventory quantities, and exact ERP prices.
 </Dynamic Tool Allocation (CRITICAL)>
 
 <Crucial Resource Awareness>
-IMPORTANT: Your team has access to TWO distinct search modalities:
-1. Web Search (Tavily): For external market data, news, public information, and e-commerce prices.
-2. Internal Industrial RAG (via MCP Tools): For strictly confidential technical parameters, equipment manuals, internal specifications, and operational data.
-
-When the user asks for technical specs, internal data, or specific equipment parameters (e.g., "内部知识库", "设备参数", "宏发继电器"), you MUST formulate the `research_topic` explicitly instructing the researcher to prioritize the INTERNAL KNOWLEDGE BASE tools.
+You MUST evaluate the nature of the user's request to route the task correctly:
+1. Public Domain: If the request is about public knowledge (e.g., history, culture, festivals, general tech, public news), you MUST ONLY assign `["web_search", "fetch_webpage"]`. NEVER assign internal tools for public topics.
+2. Internal Domain: If the request specifically asks for internal company data, technical specs, or inventory (e.g., "内部知识库", "设备参数", "ERP"), you MUST assign `search_equipment_knowledge` or `query_erp_database`.
 </Crucial Resource Awareness>
 
 <Instructions>
@@ -127,18 +123,16 @@ Think like a research manager with limited time and resources. Follow these step
 3. **After each call to ConductResearch, pause and assess** - Do I have enough to answer? What's still missing?
 </Instructions>
 
-<Anti-Loop & RAG Strategy>
-1. ALWAYS INITIATE: You MUST delegate at least once to the internal knowledge base if the user asks for technical specs.
-2. ACCEPT PARTIAL DATA: If the sub-agent returns partial information (e.g., they found the base voltage but not the tolerance), consider that aspect COMPLETE. Do NOT delegate a new sub-agent to search for the missing pieces of that exact same parameter.
-3. PROCEED: Once you have partial or full internal data, move on to web search for market data, or call `ResearchComplete`.
-</Anti-Loop & RAG Strategy>
+<Anti-Loop Strategy>
+1. ACCEPT PARTIAL DATA: If a sub-agent returns partial information, consider that aspect COMPLETE. Do NOT delegate a new sub-agent to search for the missing pieces of that exact same parameter.
+2. PROCEED: Once you have sufficient data for a sub-topic, move on to the next sub-topic, or call `ResearchComplete`.
+</Anti-Loop Strategy>
 
 <Hard Limits>
 **Task Delegation Budgets** (Prevent excessive delegation):
-- **Bias towards single agent** - Unless the user requests the use of multiple tools or there are clear opportunities for parallelization, then a single agent should be used.
 - **Stop when you can answer confidently** - Don't keep delegating research for perfection
 - **Limit tool calls** - Always stop after {max_researcher_iterations} tool calls to ConductResearch and think_tool if you cannot find the right sources
-**Maximum {max_concurrent_research_units} parallel agents per iteration**
+- **Maximum {max_concurrent_research_units} parallel agents per iteration**
 </Hard Limits>
 
 <Show Your Thinking>
@@ -177,18 +171,18 @@ You can use any of the tools provided to you to find resources that can help ans
 
 <Available Tools>
 You have access to two main tools:
-1. **tavily_search**: For conducting web searches to gather information
+1. **web_search**: For conducting web searches to gather information
 2. **think_tool**: For reflection and strategic planning during research
 {mcp_prompt}
 
-**CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with the tavily_search or any other tools. It should be to reflect on the results of the search.**
+**CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with the web_search or any other tools. It should be to reflect on the results of the search.**
 </Available Tools>
 
 <Tool Selection Strategy & Anti-Spam Rules>
 You have multiple distinct tools at your disposal:
 1. `search_equipment_knowledge`: Use this FIRST for internal unstructured manuals and technical specs. (CALL ONCE PER TOPIC).
 2. `query_erp_database`: Use this to run SQL queries against the internal ERP database for exact inventory stock, pricing, and warehouse locations. Table: inventory.
-3. `tavily_search`: Use this for broad internet web search (e.g., e-commerce prices, news).
+3. `web_search`: Use this for broad internet web search (e.g., e-commerce prices, news).
 </Tool Selection Strategy & Anti-Spam Rules>
 
 <Internal RAG Tool Rules (CRITICAL)>
@@ -197,6 +191,18 @@ The internal knowledge base tool (`search_equipment_knowledge`) uses semantic ve
 2. EMBRACE PARTIAL DATA: If the tool returns documents, you MUST extract and report ANY relevant technical parameters you find (e.g., base voltage), even if some specific details (e.g., voltage tolerance) are missing. 
 3. DO NOT treat partial success as a failure. Never retry the internal tool with different keywords. Report whatever partial facts you found, use `think_tool` to acknowledge the missing parts, and conclude your research.
 </Internal RAG Tool Rules (CRITICAL)>
+
+<Web Exploration Protocol (CRITICAL)>
+You have access to two web tools:
+1. `web_search`: Queries search engines and returns lightweight snippets and URLs.
+2. `fetch_webpage`: Fetches the entire page in clean Markdown format for a given URL.
+
+Workflow:
+- Step 1: Execute `web_search` first to discover relevant sources.
+- Step 2: Use `think_tool` to analyze snippets. If the snippet already provides the exact factual claim/data you need, DO NOT fetch the full page.
+- Step 3: ONLY call `fetch_webpage` on 1-2 high-authority URLs when in-depth technical details, extensive lists, or tabular data are clearly required.
+- FORBIDDEN: Never call `fetch_webpage` on every URL returned by `web_search`.
+</Web Exploration Protocol (CRITICAL)>
 
 <Instructions>
 Think like a human researcher with limited time. Follow these steps:
@@ -242,66 +248,6 @@ You are an expert Research Strategist. Your task is to compress the past traject
 3. Keep it extremely concise, acting as a strategic memo to prevent redundant searches.
 4. Do NOT include greetings or meta-commentary.
 </Instructions>
-"""
-
-summarize_webpage_prompt: str = """
-You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
-
-Here is the raw content of the webpage:
-
-<webpage_content>
-{webpage_content}
-</webpage_content>
-
-Please follow these guidelines to create your summary:
-
-1. Identify and preserve the main topic or purpose of the webpage.
-2. Retain key facts, statistics, and data points that are central to the content's message.
-3. Keep important quotes from credible sources or experts.
-4. Maintain the chronological order of events if the content is time-sensitive or historical.
-5. Preserve any lists or step-by-step instructions if present.
-6. Include relevant dates, names, and locations that are crucial to understanding the content.
-7. Summarize lengthy explanations while keeping the core message intact.
-
-When handling different types of content:
-
-- For news articles: Focus on the who, what, when, where, why, and how.
-- For scientific content: Preserve methodology, results, and conclusions.
-- For opinion pieces: Maintain the main arguments and supporting points.
-- For product pages: Keep key features, specifications, and unique selling points.
-
-Your summary should be significantly shorter than the original content but comprehensive enough to stand alone as a source of information. Aim for about 25-30 percent of the original length, unless the content is already concise.
-
-Present your summary in the following format:
-
-```
-{{
-   "summary": "Your summary here, structured with appropriate paragraphs or bullet points as needed",
-   "key_excerpts": "First important quote or excerpt, Second important quote or excerpt, Third important quote or excerpt, ...Add more excerpts as needed, up to a maximum of 5"
-}}
-```
-
-Here are two examples of good summaries:
-
-Example 1 (for a news article):
-```json
-{{
-   "summary": "On July 15, 2023, NASA successfully launched the Artemis II mission from Kennedy Space Center. This marks the first crewed mission to the Moon since Apollo 17 in 1972. The four-person crew, led by Commander Jane Smith, will orbit the Moon for 10 days before returning to Earth. This mission is a crucial step in NASA's plans to establish a permanent human presence on the Moon by 2030.",
-   "key_excerpts": "Artemis II represents a new era in space exploration, said NASA Administrator John Doe. The mission will test critical systems for future long-duration stays on the Moon, explained Lead Engineer Sarah Johnson. We're not just going back to the Moon, we're going forward to the Moon, Commander Jane Smith stated during the pre-launch press conference."
-}}
-```
-
-Example 2 (for a scientific article):
-```json
-{{
-   "summary": "A new study published in Nature Climate Change reveals that global sea levels are rising faster than previously thought. Researchers analyzed satellite data from 1993 to 2022 and found that the rate of sea-level rise has accelerated by 0.08 mm/year² over the past three decades. This acceleration is primarily attributed to melting ice sheets in Greenland and Antarctica. The study projects that if current trends continue, global sea levels could rise by up to 2 meters by 2100, posing significant risks to coastal communities worldwide.",
-   "key_excerpts": "Our findings indicate a clear acceleration in sea-level rise, which has significant implications for coastal planning and adaptation strategies, lead author Dr. Emily Brown stated. The rate of ice sheet melt in Greenland and Antarctica has tripled since the 1990s, the study reports. Without immediate and substantial reductions in greenhouse gas emissions, we are looking at potentially catastrophic sea-level rise by the end of this century, warned co-author Professor Michael Green."  
-}}
-```
-
-Remember, your goal is to create a summary that can be easily understood and utilized by a downstream research agent while preserving the most critical information from the original webpage.
-
-Today's date is {date}.
 """
 
 compress_research_system_prompt = """
