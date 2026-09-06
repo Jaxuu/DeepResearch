@@ -43,7 +43,7 @@ class ConductResearch(BaseModel):
         default=["web_search", "fetch_webpage"])
     # 技能分配字段
     required_skills: List[str] = Field(
-        description="分配给该研究员的专业技能。目前可用选项: 'quantitative_analysis'",
+        description="分配给该研究员的专业技能。目前可用选项: 'quantitative_analysis', 'long_doc_mining'",
         default=[])
 
 class ResearchComplete(BaseModel):

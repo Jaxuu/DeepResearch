@@ -26,6 +26,10 @@ from langchain_core.tools import (
     ToolException,
     tool,
 )
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
+from langchain.chat_models import init_chat_model
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_experimental.utilities import PythonREPL
 
@@ -254,6 +258,113 @@ async def quantitative_analysis_skill(data_context: str, calculation_goal: str, 
             current_prompt += f"\n\nSystem error occurred: {str(e)}\nFix the issue and rewrite."
 
     return "[❌ Skill Failed] Unable to compute the requested data after multiple attempts. You may need to rely on the raw text."
+
+
+@tool(
+    description="""A Sub-RAG skill for deep mining of EXTREMELY LONG documents (e.g., annual reports, SEC filings, PDFs, long academic papers). 
+    Use this when 'fetch_webpage' is not enough due to length limits. 
+    Pass the specific 'url' and a highly detailed 'extraction_query'. It will read the entire document in the background and extract the exact answer."""
+)
+async def long_doc_mining_skill(url: str, extraction_query: str, config: RunnableConfig = None) -> str:
+    """
+    长文/PDF 深度挖掘技能。
+    突破 15000 字符限制，使用内存级 BM25 检索目标块，交由小模型精准提纯。
+    """
+    # 1. 全量获取文档 (无字符截断)
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "X-Timeout": "30"  # 延长超时时间以应对巨型 PDF
+    }
+
+    # 自动携带 Jina Key（如果有配置）
+    jina_key = os.getenv("JINA_API_KEY")
+    if jina_key:
+        headers["Authorization"] = f"Bearer {jina_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            response = await client.get(jina_url, headers=headers)
+            if response.status_code != 200:
+                return f"[❌ Skill Failed] Unable to fetch {url}. Status: {response.status_code}"
+            full_content = response.text
+    except Exception as e:
+        return f"[❌ Skill Failed] Network error fetching {url}: {str(e)}"
+
+    # 2. 内存级快速文本切片
+    splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=300)
+    chunks = splitter.split_text(full_content)
+
+    # 如果文档并不长，无需 RAG，直接取全部
+    if len(chunks) <= 3:
+        context = full_content
+    else:
+        # 3. 本地 BM25 召回最相关的 Top-5 块 (不耗费任何 API Token)
+        docs = [Document(page_content=chunk) for chunk in chunks]
+        retriever = BM25Retriever.from_documents(docs)
+        retriever.k = 5
+        top_docs = retriever.invoke(extraction_query)
+        context = "\n\n---\n\n".join([d.page_content for d in top_docs])
+
+    # 4. 唤醒便宜的小模型执行阅读理解与提纯
+    from open_deep_research.configuration import Configuration
+    configurable = Configuration.from_runnable_config(config)
+
+    # 就地初始化模型，防止与 deep_researcher 产生循环引用
+    skill_model = init_chat_model(
+        model=configurable.compression_model,
+        api_key=get_api_key_for_model(configurable.compression_model, config),
+        max_tokens=1500
+    )
+
+    prompt = f"""You are an elite Data Extraction Analyst.
+                    <Source URL>
+                    {url}
+                    </Source URL>
+                    
+                    <Your Task>
+                    Extract precise information to answer this query: {extraction_query}
+                    </Your Task>
+                    
+                    <Retrieved Context>
+                    {context}
+                    </Retrieved Context>
+                    
+                    <Instructions>
+                    1. Synthesize the answer ONLY using the <Retrieved Context>. Do not hallucinate.
+                    2. If the context does not contain the answer, explicitly state: "The requested information could not be found in the document."
+                    3. Include specific numbers, dates, and metrics if present.
+                    </Instructions>
+                """
+
+    try:
+        res = await skill_model.ainvoke([HumanMessage(content=prompt)])
+        return f"[✅ Long-Doc Mining Success]\nExtracted from {url}:\n{res.content}"
+    except Exception as e:
+        return f"[❌ Skill Failed] LLM extraction error: {str(e)}"
+
+# 在这里注册所有可用的复合技能
+AVAILABLE_SKILLS = {
+    "quantitative_analysis": quantitative_analysis_skill,
+    "long_doc_mining": long_doc_mining_skill
+}
+
+def get_active_skills(assigned_skill_names: List[str]) -> List[Any]:
+    """
+    根据状态中传入的技能名称列表，动态映射并返回对应的技能实体函数。
+    """
+    active_skills = []
+    if not assigned_skill_names:
+        return active_skills
+
+    for skill_name in assigned_skill_names:
+        skill_func = AVAILABLE_SKILLS.get(skill_name)
+        if skill_func:
+            active_skills.append(skill_func)
+        else:
+            print(f"\n[⚠️ 技能告警] 未找到名为 '{skill_name}' 的技能配置，跳过挂载。")
+
+    return active_skills
 
 ##########################
 # 基础工具组件

@@ -63,6 +63,8 @@ from open_deep_research.utils import (
     remove_up_to_last_ai_message,
     think_tool,
     quantitative_analysis_skill,
+    long_doc_mining_skill,
+    get_active_skills
 )
 
 # 初始化一个可配置的模型，将在整个智能体中使用
@@ -530,9 +532,12 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
 
     # 精准挂载分配的技能
     assigned_skills = state.get("required_skills", [])
-    if "quantitative_analysis" in assigned_skills:
-        active_tools.append(quantitative_analysis_skill)
-        print(f"\n[🔧 技能挂载] 激活 Python 量化计算沙箱 (quantitative_analysis)")
+    loaded_skills = get_active_skills(assigned_skills)
+
+    if loaded_skills:
+        active_tools.extend(loaded_skills)
+        loaded_skill_names = [s.name for s in loaded_skills]
+        print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
 
     active_tool_names = [t.name if hasattr(t, "name") else t.get("name") for t in active_tools]
     print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
@@ -613,9 +618,9 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
 
     # 第2步：处理工具调用（搜索、MCP 工具、skills等）
     tools = await get_all_tools(config)
+    # 动态合并分配到的所有技能
     assigned_skills = state.get("required_skills", [])
-    if "quantitative_analysis" in assigned_skills:
-        tools.append(quantitative_analysis_skill)
+    tools.extend(get_active_skills(assigned_skills))
 
     tools_by_name = {
         tool.name if hasattr(tool, "name") else tool.get("name", "web_search"): tool

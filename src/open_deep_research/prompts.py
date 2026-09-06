@@ -105,10 +105,11 @@ When calling `ConductResearch`, you MUST set the `required_tools` field strictly
 </Tool Allocation (CRITICAL)>
 
 <Skill Allocation (CRITICAL)>
-Evaluate if the `ConductResearch` task requires quantitative rigor:
-- If it needs financial processing, math, stats, or unit conversions, assign `required_skills=["quantitative_analysis"]`.
-- MANDATORY: If you assign this skill, you MUST explicitly write the calculation instruction into the `research_topic` string (e.g., "Find BYD and Tesla 2023 revenue and sales, THEN use your quantitative skill to calculate average revenue per vehicle"). Do not just ask them to find data; explicitly order them to compute it.
-- For purely qualitative tasks, leave `required_skills=[]`.
+Evaluate if the `ConductResearch` task requires specialized skills:
+1. `quantitative_analysis`: Assign if the task needs financial processing, math, stats, or unit conversions. 
+2. `long_doc_mining`: Assign if the task explicitly requires reading SEC 10-K filings, annual reports, whitepapers, long PDFs, or academic papers.
+- MANDATORY: If you assign ANY skill, explicitly write the execution instruction into the `research_topic` (e.g., "Find the URL for BYD's 2023 Annual Report, THEN use long_doc_mining to extract revenue data").
+- For qualitative, standard web queries, leave `required_skills=[]`.
 </Skill Allocation (CRITICAL)>
 
 <Execution & Thinking Strategy>
@@ -145,7 +146,10 @@ You only have access to the tools specifically bound to you. Follow these strict
    - IF assigned, you are FORBIDDEN from performing manual math, currency conversions, or statistical calculations yourself.
    - EXECUTION MANDATE: If this skill is in your arsenal, your research task is NOT COMPLETE until you have successfully passed the raw data into this tool and received the final numerical output. Do NOT terminate research early.
    - Workflow: Gather raw data -> Pass raw data and calculation goal to the skill -> Wait for the Python sandbox output.
-4. **Reflection (`think_tool`)**:
+4. **Long-Doc Mining Skill (`long_doc_mining_skill`)**:
+   - IF assigned, use this when a source is an extremely long report or PDF where `fetch_webpage` might truncate critical data.
+   - Workflow: Discover the document URL via `web_search` -> Pass the URL and your precise extraction question to `long_doc_mining_skill` -> Wait for the Sub-RAG extraction result.
+5. **Reflection (`think_tool`)**:
    - Use BEFORE your very first action to plan your search strategy and formulate exact queries.
    - Use AFTER each search/skill execution to assess progress (What did I find? What's missing?).
    - NEVER call `think_tool` in parallel with other tools.
@@ -298,14 +302,18 @@ Today's date is {date}.
 3. Verify Fact: Check if the statement is fully supported by the exact source in the <Ground-Truth FactBoard>.
 4. Aggregate: If ANY claim is ungrounded, fabricated, or has a mismatched citation, set `has_hallucinations` to true, list it in `hallucinated_claims`, and lower the `citation_precision_score`.
 
-CRITICAL JSON FORMATTING:
-- Output a flat JSON object with EXACTLY keys: "detailed_checks", "has_hallucinations", "citation_precision_score", "hallucinated_claims", "feedback".
-- The `detailed_checks` array MUST contain complete objects with ALL FOUR keys:
+CRITICAL FORMATTING RULES (FAILURE TO FOLLOW WILL CRASH THE SYSTEM):
+- You MUST respond strictly using the provided JSON schema.
+- Output the flat JSON object directly with EXACTLY these keys: "detailed_checks", "has_hallucinations", "citation_precision_score", "hallucinated_claims", "feedback".
+- The `detailed_checks` array MUST contain complete JSON OBJECTS. 
+- DATA TYPE WARNING: The `citation_index` MUST be a JSON array of integers (e.g., [1]), NEVER a string (like "[1]").
+- EVERY SINGLE ITEM in the `detailed_checks` array MUST explicitly include ALL FOUR keys: "claim", "citation_index", "is_supported", and "reason". DO NOT skip keys for any item.
+  Example of ONE valid item:
   {{
-    "claim": "Sentence from report",
+    "claim": "The exact sentence from the report",
     "citation_index": [1], 
     "is_supported": true,
-    "reason": "Why it is supported/hallucinated"
+    "reason": "Explanation of why it is supported or hallucinated"
   }}
 </Verification Directives>
 """
