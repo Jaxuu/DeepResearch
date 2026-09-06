@@ -37,11 +37,14 @@ class ConductResearch(BaseModel):
     research_topic: str = Field(
         description="待调研的具体子主题。必须是单一主题，且需包含高度详尽的描述（至少一段话）。",
     )
-    # 【新增】：技能清单，带上备选工具的枚举说明
+    # 技能清单，带上备选工具的枚举说明
     required_tools: List[str] = Field(
         description="The specific tools this agent should have access to. Options: 'web_search', 'fetch_webpage', 'search_equipment_knowledge', 'query_erp_database'",
-        default=["web_search", "fetch_webpage"]
-    )
+        default=["web_search", "fetch_webpage"])
+    # 技能分配字段
+    required_skills: List[str] = Field(
+        description="分配给该研究员的专业技能。目前可用选项: 'quantitative_analysis'",
+        default=[])
 
 class ResearchComplete(BaseModel):
     """调用此工具表示所有调研工作已完成。"""
@@ -152,6 +155,7 @@ class ResearcherState(TypedDict):
     compressed_research: str
     tool_call_iterations: int = 0
     required_tools: list[str]
+    required_skills: list[str]
     tool_call_id: str
 
 class ResearcherOutputState(BaseModel):

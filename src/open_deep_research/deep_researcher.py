@@ -62,6 +62,7 @@ from open_deep_research.utils import (
     openai_websearch_called,
     remove_up_to_last_ai_message,
     think_tool,
+    quantitative_analysis_skill,
 )
 
 # 初始化一个可配置的模型，将在整个智能体中使用
@@ -91,9 +92,9 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     # 第2步：准备模型进行结构化澄清分析
     messages = state["messages"]
     model_config = {
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "model": configurable.supervisor_model,
+        "max_tokens": configurable.supervisor_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.supervisor_model, config),
         "tags": ["langsmith:nostream"]
     }
 
@@ -143,9 +144,9 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     # 第1步：设置用于结构化输出的研究模型
     configurable = Configuration.from_runnable_config(config)
     research_model_config = {
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "model": configurable.supervisor_model,
+        "max_tokens": configurable.supervisor_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.supervisor_model, config),
         "tags": ["langsmith:nostream"]
     }
 
@@ -203,9 +204,9 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     # 第1步：配置主管模型及可用工具
     configurable = Configuration.from_runnable_config(config)
     research_model_config = {
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "model": configurable.supervisor_model,
+        "max_tokens": configurable.supervisor_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.supervisor_model, config),
         "tags": ["langsmith:nostream"]
     }
 
@@ -257,12 +258,21 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     # 定义研究阶段的退出条件
     exceeded_allowed_iterations = research_iterations > configurable.max_researcher_iterations
     no_tool_calls = not most_recent_message.tool_calls
-    research_complete_tool_call = any(
+
+    # 提取派发任务
+    conduct_research_calls = [
+        tool_call for tool_call in most_recent_message.tool_calls
+        if tool_call["name"] == "ConductResearch"
+    ]
+
+    # 只有在【没有派发新任务】的前提下，完成信号才生效
+    research_complete_called = any(
         tool_call["name"] == "ResearchComplete" for tool_call in most_recent_message.tool_calls
     )
+    should_end_research = research_complete_called and not conduct_research_calls
 
     # 如果满足任一终止条件则退出
-    if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
+    if exceeded_allowed_iterations or no_tool_calls or should_end_research:
         return Command(
             goto=END,
             update={"structured_facts": state.get("structured_facts", [])}
@@ -303,6 +313,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 "researcher_messages": [HumanMessage(content=tool_call["args"]["research_topic"])],
                 "research_topic": tool_call["args"]["research_topic"],
                 "required_tools": tool_call["args"].get("required_tools", ["web_search", "fetch_webpage"]),
+                "required_skills": tool_call["args"].get("required_skills", []),
                 "tool_call_id": tool_call["id"]  # 注入溯源 ID
             }))
 
@@ -507,7 +518,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
             "未找到可用于研究的工具：请配置您的搜索 API 或在配置中添加 MCP 工具。"
         )
 
-    # 精准挂载分配的技能
+    # 精准挂载分配的工具
     allowed_tool_names = state.get("required_tools", ["web_search", "fetch_webpage"])
     active_tools = []
 
@@ -517,6 +528,12 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         if tool_name == "think_tool" or tool_name in allowed_tool_names:
             active_tools.append(tool)
 
+    # 精准挂载分配的技能
+    assigned_skills = state.get("required_skills", [])
+    if "quantitative_analysis" in assigned_skills:
+        active_tools.append(quantitative_analysis_skill)
+        print(f"\n[🔧 技能挂载] 激活 Python 量化计算沙箱 (quantitative_analysis)")
+
     active_tool_names = [t.name if hasattr(t, "name") else t.get("name") for t in active_tools]
     print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
 
@@ -524,8 +541,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     research_model_config = {
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
+        "api_key": get_api_key_for_model(configurable.research_model, config)
     }
 
     # 准备系统提示词，如果可用则包含 MCP 上下文
@@ -595,8 +611,12 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     if not has_tool_calls and not has_native_search:
         return Command(goto="compress_research")
 
-    # 第2步：处理其他工具调用（搜索、MCP 工具等）
+    # 第2步：处理工具调用（搜索、MCP 工具、skills等）
     tools = await get_all_tools(config)
+    assigned_skills = state.get("required_skills", [])
+    if "quantitative_analysis" in assigned_skills:
+        tools.append(quantitative_analysis_skill)
+
     tools_by_name = {
         tool.name if hasattr(tool, "name") else tool.get("name", "web_search"): tool
         for tool in tools
@@ -707,7 +727,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         except Exception as e:
             synthesis_attempts += 1
             # 处理 token 超限，通过移除较旧的消息
-            if is_token_limit_exceeded(e, configurable.research_model):
+            if is_token_limit_exceeded(e, configurable.compression_model):
                 researcher_messages = remove_up_to_last_ai_message(researcher_messages)
                 continue
             # 其他错误，继续重试
@@ -806,7 +826,7 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
             )
         ])
 
-    # 核心拦截器：查找被大模型遗漏的事实 ID（防止幻觉导致数据丢失）
+    # 核心拦截器1：查找被大模型遗漏的事实 ID（防止幻觉导致数据丢失）
     assigned_indices = set()
     for sec in response.sections:
         assigned_indices.update(sec.relevant_fact_indices)
@@ -822,6 +842,8 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
         ))
 
     send_actions = []
+    valid_sections = []  # 记录真正派发成功的有效章节
+
     for sec in response.sections:
         # 精准切片：只提取当前章节被分配到的事实
         assigned_facts = []
@@ -829,9 +851,11 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
             if 0 <= idx < len(structured_facts):  # 防止幻觉越界
                 assigned_facts.append(structured_facts[idx])
 
-        # 如果该章节没有分到任何事实，直接跳过不生成
+        # 核心拦截器 2：如果该章节没有分到任何事实，直接从大纲中剔除，不予派发
         if not assigned_facts:
             continue
+
+        valid_sections.append(sec)
 
         send_actions.append(Send("write_section", {
             "section_title": sec.section_title,
@@ -842,7 +866,7 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
 
     return Command(
         goto=send_actions,
-        update={"report_outline": response.sections,
+        update={"report_outline": valid_sections,
                 "section_drafts": {"type": "override", "value": []}}
     )
 
@@ -976,9 +1000,9 @@ async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[L
     )
 
     writer_model_config = {
-        "model": configurable.rewrite_model,
-        "max_tokens": configurable.rewrite_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.rewrite_model, config),
+        "model": configurable.final_report_model,
+        "max_tokens": configurable.final_report_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.final_report_model, config),
         "tags": ["langsmith:nostream"]
     }
 

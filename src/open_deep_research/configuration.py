@@ -144,6 +144,26 @@ class Configuration(BaseModel):
             }
         }
     )
+    supervisor_model: str = Field(
+        default=os.getenv("SUPERVISOR_MODEL"),
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": os.getenv("SUPERVISOR_MODEL"),
+                "description": "Model for supervising the research process"
+            }
+        }
+    )
+    supervisor_model_max_tokens: int = Field(
+        default=8192,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 8192,
+                "description": "Maximum output tokens for supervisor model"
+            }
+        }
+    )
     research_model: str = Field(
         default=os.getenv("RESEARCH_MODEL"),
         metadata={
@@ -220,26 +240,6 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "number",
                 "default": 4000,
-                "description": "Maximum output tokens for verifier model"
-            }
-        }
-    )
-    rewrite_model: str = Field(
-        default=os.getenv("REWRITE_MODEL"),
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": os.getenv("REWRITE_MODEL"),
-                "description": "Model for rewriting the generated report"
-            }
-        }
-    )
-    rewrite_model_max_tokens: int = Field(
-        default=8192,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 8192,
                 "description": "Maximum output tokens for verifier model"
             }
         }

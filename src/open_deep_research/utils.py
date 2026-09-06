@@ -5,21 +5,18 @@ import logging
 import os
 import httpx
 import warnings
+import re
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
-from contextlib import AsyncExitStack
 
 from tavily import AsyncTavilyClient
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
 
-from langchain.chat_models import init_chat_model
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
-    MessageLikeRepresentation,
-    filter_messages,
+    MessageLikeRepresentation
 )
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import (
@@ -30,6 +27,7 @@ from langchain_core.tools import (
     tool,
 )
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_experimental.utilities import PythonREPL
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.state import ResearchComplete
@@ -142,7 +140,6 @@ def think_tool(reflection: str) -> str:
 # 保证跨越 Supervisor 和 Sub-agent 多个节点时，网络通道持久存活
 _mcp_client = None
 
-
 async def load_mcp_tools(
         config,
         existing_tool_names: set[str],
@@ -185,6 +182,78 @@ async def load_mcp_tools(
             configured_tools.append(mcp_tool)
 
     return configured_tools
+
+##########################
+# Skill工具组件
+##########################
+
+# 初始化 REPL 单例
+_python_repl = PythonREPL()
+
+@tool(
+    description="A highly capable quantitative analysis skill. Pass in raw data (like financial tables or stats) and a specific calculation goal. It will autonomously write, execute, and debug code to find the answer.")
+async def quantitative_analysis_skill(data_context: str, calculation_goal: str, config: RunnableConfig = None) -> str:
+    """
+    Skill: 动态量化分析沙箱。
+    向内部大模型隐藏复杂的代码生成与执行逻辑，对外仅暴露自然语言接口。
+
+    Args:
+        data_context: 包含所有计算所需原始数值的文本片段（如财报段落、表格摘录）。
+        calculation_goal: 明确的计算指令（例如："Calculate the profit margin and convert it to a percentage"）。
+    """
+    # 动态获取配置中的模型资源，为 Skill 内部的“隐形工头”提供算力
+    from open_deep_research.configuration import Configuration
+    from open_deep_research.deep_researcher import configurable_model
+
+    configurable = Configuration.from_runnable_config(config)
+    skill_model = configurable_model.with_config({
+        "model": configurable.compression_model,  # 使用速度快、成本低的小模型写代码即可
+        "max_tokens": 1000,
+        "api_key": get_api_key_for_model(configurable.compression_model, config),
+    })
+
+    system_prompt = f"""You are a Python Data Analyst. Your job is to achieve the calculation goal based on the data.
+                        Data Context:
+                        {data_context}
+                        
+                        Goal: {calculation_goal}
+                        
+                        Write a python script to compute this. Print the exact final numerical result clearly.
+                        Return ONLY valid python code wrapped in ```python```. Do not explain."""
+
+    max_retries = 3
+    current_prompt = system_prompt
+
+    # SOP 闭环：生成 -> 执行 -> 校验验 -> 自愈
+    for attempt in range(max_retries):
+        try:
+            # 1. 内部生成代码
+            response = await skill_model.ainvoke([HumanMessage(content=current_prompt)])
+
+            # 2. 提取代码块
+            code_match = re.search(r"```python\n(.*?)\n```", response.content, re.DOTALL)
+            code = code_match.group(1) if code_match else response.content.replace("```python", "").replace("```", "")
+
+            # 3. 沙箱执行
+            output = _python_repl.run(code)
+
+            # 4. 结果校验
+            if "Error" in output or "Exception" in output or "Traceback" in output:
+                # 触发自愈逻辑，将错误喂回给模型
+                current_prompt += f"\n\nPrevious attempt failed with error:\n{output}\nPlease fix the code and try again."
+                continue
+
+            if not output.strip():
+                current_prompt += f"\n\nPrevious attempt ran successfully but printed nothing. You MUST use print() to output the final result."
+                continue
+
+            # 成功则直接将结果抛给外层的 Researcher
+            return f"[✅ Skill Verified Calculation] Successfully executed quantitative analysis.\nResult details:\n{output.strip()}"
+
+        except Exception as e:
+            current_prompt += f"\n\nSystem error occurred: {str(e)}\nFix the issue and rewrite."
+
+    return "[❌ Skill Failed] Unable to compute the requested data after multiple attempts. You may need to rely on the raw text."
 
 ##########################
 # 基础工具组件
@@ -344,12 +413,12 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
         model_str = str(model_name).lower()
         if model_str.startswith('openai:'):
             provider = 'openai'
-        elif model_str.startswith('qwen') or 'qwen' in model_str:
-            provider = 'qwen'
         elif model_str.startswith('anthropic:'):
             provider = 'anthropic'
         elif model_str.startswith('gemini:') or model_str.startswith('google:'):
             provider = 'gemini'
+        else:
+            provider = 'qwen'
 
     # 步骤 2：检查特定供应商的 Token 超限模式
     if provider == 'openai':
