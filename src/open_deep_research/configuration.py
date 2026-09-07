@@ -132,18 +132,6 @@ class Configuration(BaseModel):
         }
     )
     # 模型配置
-    max_content_length: int = Field(
-        default=12000,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 50000,
-                "min": 1000,
-                "max": 200000,
-                "description": "Maximum character length for webpage content before summarization"
-            }
-        }
-    )
     supervisor_model: str = Field(
         default=os.getenv("SUPERVISOR_MODEL"),
         metadata={

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
@@ -64,6 +65,7 @@ from open_deep_research.utils import (
     think_tool,
     quantitative_analysis_skill,
     long_doc_mining_skill,
+    data_visualization_skill,
     get_active_skills
 )
 
@@ -710,6 +712,24 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             # 执行压缩， 强制挂载 FactBoard 结构化输出
             response = await structured_synthesizer_model.ainvoke(messages)
 
+            # 用 Python 物理提取图表，绝对不依赖大模型的自觉性
+            for msg in state.get("researcher_messages", []):
+                # 找到可视化工具的输出消息
+                if getattr(msg, "name", None) == "data_visualization_skill":
+                    # 正则匹配 Markdown 图片链接 ![xxx](yyy)
+                    chart_match = re.search(r'(!\[.*?\]\(.*?\))', msg.content)
+                    if chart_match:
+                        # 强制构造一个 Fact 对象并追加到大模型的输出结果中
+                        # 注意：需要确保你的上下文中能访问到 Fact 类
+                        chart_fact = Fact(
+                            entity="Data Visualization Chart",
+                            claim=chart_match.group(1),
+                            source="data_visualization_skill"
+                        )
+                        # 如果 response.facts 已经存在，则追加进去
+                        if hasattr(response, 'facts'):
+                            response.facts.append(chart_fact)
+
             # 提取当前子图中所有消息的 ID (包含庞大的 ToolMessage)
             delete_messages = [
                 RemoveMessage(id=m.id)
@@ -851,13 +871,20 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
 
     for sec in response.sections:
         # 精准切片：只提取当前章节被分配到的事实
-        assigned_facts = []
+        assigned_facts_with_ids = []
         for idx in sec.relevant_fact_indices:
             if 0 <= idx < len(structured_facts):  # 防止幻觉越界
-                assigned_facts.append(structured_facts[idx])
+                fact = structured_facts[idx]
+                # 将 Fact 转换为字典，并强制注入与 assemble_report 对应的全局 ID (idx + 1)
+                assigned_facts_with_ids.append({
+                    "global_id": idx + 1,
+                    "entity": getattr(fact, 'entity', ''),
+                    "claim": getattr(fact, 'claim', ''),
+                    "source": getattr(fact, 'source', '')
+                })
 
         # 核心拦截器 2：如果该章节没有分到任何事实，直接从大纲中剔除，不予派发
-        if not assigned_facts:
+        if not assigned_facts_with_ids:
             continue
 
         valid_sections.append(sec)
@@ -865,7 +892,7 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
         send_actions.append(Send("write_section", {
             "section_title": sec.section_title,
             "section_description": sec.description,
-            "assigned_facts": assigned_facts,  # 替换原先的全量 facts
+            "assigned_facts": assigned_facts_with_ids,  # 下发包含 global_id 的字典
             "research_brief": state.get("research_brief", "")
         }))
 
@@ -880,10 +907,18 @@ async def write_section(state: WriteSectionState, config: RunnableConfig):
     """并发写手节点：利用分配到的极少量事实撰写局部章节。"""
     configurable = Configuration.from_runnable_config(config)
 
-    # 此时 state["assigned_facts"] 通常只有几条到十几条，毫无 Token 压力
+    # 提前把分配给这个章节的图表链接提取出来备用
+    chart_links = []
+    for f in state["assigned_facts"]:
+        claim = getattr(f, 'claim', '')
+        # 寻找形如 ![alt](url) 的 Markdown 图片
+        match = re.search(r'(!\[.*?\]\(.*?\))', claim)
+        if match:
+            chart_links.append(match.group(1))
+
+    # 使用 global_id 作为事实的明显标识
     formatted_findings = "\n".join([
-        # 保留真实 Source 用于打引用标签
-        f"Fact: Entity: {getattr(f, 'entity', '')} | Claim: {getattr(f, 'claim', '')} | Source: {getattr(f, 'source', '')}"
+        f"Fact [{f['global_id']}]: Entity: {f.get('entity', '')} | Claim: {f.get('claim', '')} | Source: {f.get('source', '')}"
         for f in state["assigned_facts"]
     ])
 
@@ -902,11 +937,18 @@ async def write_section(state: WriteSectionState, config: RunnableConfig):
     })
 
     section_content = await writer_model.ainvoke([HumanMessage(content=prompt)])
+    final_text = section_content.content
+
+    # 检查大模型是否漏掉了图表或篡改了链接
+    for chart in chart_links:
+        if chart not in final_text:
+            # 如果原封不动的图表链接不在正文里，说明大模型犯病了，我们强行补在章节最后
+            final_text += f"\n\n{chart}\n\n"
 
     return {
         "section_drafts": [SectionDraft(
             section_title=state["section_title"],
-            content=section_content.content
+            content=final_text
         )]
     }
 
@@ -992,6 +1034,8 @@ async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[L
     current_report = state.get("final_report", "")
     feedback = state.get("verification_feedback", "")
 
+    existing_charts = re.findall(r'(!\[.*?\]\(.*?\))', current_report)
+
     formatted_facts = "\n".join([
         f"- Entity: {getattr(f, 'entity', 'Unknown')} | Claim: {getattr(f, 'claim', '')} | Source: {getattr(f, 'source', '')}"
         for f in structured_facts
@@ -1014,6 +1058,22 @@ async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[L
     revised_report = await configurable_model.with_config(writer_model_config).ainvoke([
         HumanMessage(content=rewrite_prompt)
     ])
+
+    final_text = revised_report.content
+
+    # 检查大模型在重写时是否删掉了图表
+    for chart in existing_charts:
+        if chart not in final_text:
+            # 如果大模型误删了图表，我们强行把它插回正文和参考文献之间
+            if "参考文献 (Sources)" in final_text:
+                final_text = final_text.replace("参考文献 (Sources)", f"\n\n{chart}\n\n参考文献 (Sources)")
+            elif "## Sources" in final_text:
+                final_text = final_text.replace("## Sources", f"\n\n{chart}\n\n## Sources")
+            else:
+                final_text += f"\n\n{chart}\n\n"
+
+    # 同步更新 Message 对象里的内容，保持状态一致
+    revised_report.content = final_text
 
     return Command(
         goto="report_verifier",

@@ -34,9 +34,9 @@ ASSISTANT_ID = "Deep Researcher"
 
 def get_new_client():
     """
-    每次调用时创建一个新的客户端实例，并配置 10 分钟超长超时时间防止中断。
+    每次调用时创建一个新的客户端实例，配置 3600 秒超长超时时间防止深度调研中断。
     """
-    timeout_config = httpx.Timeout(600.0)
+    timeout_config = httpx.Timeout(3600.0)  # 修改：600 -> 3600
     return get_client(
         url=LANGGRAPH_URL,
         headers={"Authorization": "Bearer local-dev-token-123"},
@@ -217,15 +217,26 @@ if prompt or is_resuming:
 
             async for chunk in stream:
                 # ====== 通道 A：精准节点切换监听 (Updates 模式) ======
+                # ====== 通道 A：精准节点切换监听 (Updates 模式) ======
                 if chunk.event == "updates":
                     completed_nodes = list(chunk.data.keys())
                     for node in completed_nodes:
                         if node == "clarify_with_user":
                             status.update(label="📝 正在生成结构化调研提纲...", expanded=False)
                         elif node == "write_research_brief":
-                            status.update(label="🧠 主管已接管，正在战略反思与任务派发...", expanded=False)
+                            status.update(label="🧠 主管已接管，正在规划战略...", expanded=False)
                             if not display_locked_to_final: message_placeholder.empty()
-                        elif node == "human_review":
+
+                        # === 新增：让深度调研核心循环的每一步都反映在 UI 上 ===
+                        elif node == "supervisor":
+                            status.update(label="🕵️‍♂️ 主管正在调度研究员与分配子任务...", expanded=False)
+                        elif node == "researcher":
+                            status.update(label="🔍 子研究员正在全网检索与深度阅读...", expanded=False)
+                        elif node == "compress_research":
+                            status.update(label="🗜️ 子研究员正在压缩与提炼结构化事实库...", expanded=False)
+                        # ==================================================
+
+                        elif node == "gen":
                             status.update(label="📑 正在根据情报规划报告大纲...", expanded=False)
                         elif node == "generate_outline":
                             status.update(label="⚡ 正在并发撰写各章节内容...", expanded=False)

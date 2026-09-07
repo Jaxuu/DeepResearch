@@ -1,6 +1,6 @@
 """Deep Research 智能体的图状态定义与数据结构。"""
 import operator
-from typing import Annotated, Optional, List, Union, Any
+from typing import Annotated, Optional, List, Union, Any, Dict
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
@@ -43,7 +43,7 @@ class ConductResearch(BaseModel):
         default=["web_search", "fetch_webpage"])
     # 技能分配字段
     required_skills: List[str] = Field(
-        description="分配给该研究员的专业技能。目前可用选项: 'quantitative_analysis', 'long_doc_mining'",
+        description="分配给该研究员的专业技能。目前可用选项: 'quantitative_analysis', 'long_doc_mining', 'data_visualization'",
         default=[])
 
 class ResearchComplete(BaseModel):
@@ -144,7 +144,7 @@ class WriteSectionState(TypedDict):
     """并发写手节点的独立状态"""
     section_title: str
     section_description: str
-    assigned_facts: list[Fact]
+    assigned_facts: List[Dict[str, Any]]
     research_brief: str
 
 class ResearcherState(TypedDict):

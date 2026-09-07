@@ -1,6 +1,7 @@
 """Deep Research 智能体的实用工具与辅助函数。"""
 
 import asyncio
+import json
 import logging
 import os
 import httpx
@@ -9,6 +10,7 @@ import re
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
+import urllib.parse
 from tavily import AsyncTavilyClient
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
@@ -225,7 +227,7 @@ async def quantitative_analysis_skill(data_context: str, calculation_goal: str, 
                         Write a python script to compute this. Print the exact final numerical result clearly.
                         Return ONLY valid python code wrapped in ```python```. Do not explain."""
 
-    max_retries = 3
+    max_retries = 5
     current_prompt = system_prompt
 
     # SOP 闭环：生成 -> 执行 -> 校验验 -> 自愈
@@ -343,10 +345,106 @@ async def long_doc_mining_skill(url: str, extraction_query: str, config: Runnabl
     except Exception as e:
         return f"[❌ Skill Failed] LLM extraction error: {str(e)}"
 
+
+@tool(
+    description="""A specialized Data Visualization skill. 
+    Use this when you need to create charts, graphs, or diagrams (e.g., comparing revenue, visualizing market share, showing timelines).
+    Pass the raw numerical data or relationships as 'data_context', and state exactly what kind of chart you want in 'visualization_goal'."""
+)
+
+
+
+
+@tool
+async def data_visualization_skill(data_context: str, visualization_goal: str, config: RunnableConfig = None) -> str:
+    """
+    调用外部工业级图表 QuickChart API 生成真实图片链接
+    """
+    from open_deep_research.configuration import Configuration
+    from langchain.chat_models import init_chat_model
+
+    configurable = Configuration.from_runnable_config(config)
+    skill_model = init_chat_model(
+        model=configurable.compression_model,
+        temperature=0.1,
+        max_tokens=1500
+    )
+
+    # 工业界做法：让模型只输出标准的 Chart.js JSON 配置，这种 JSON 模型极难出错
+    prompt = f"""You are a Data Visualization API expert. Create a Chart.js JSON configuration for the following goal.
+                <Data Context>
+                {data_context}
+                </Data Context>
+                <Goal>
+                {visualization_goal}
+                </Goal>
+                
+                <Strict Rules>
+                1. Output ONLY a valid JSON object representing a Chart.js configuration.
+                2. NO markdown formatting, NO backticks, NO explanations.
+                3. Example of valid output:
+                {{
+                  "type": "bar",
+                  "data": {{
+                    "labels": ["Apple", "Microsoft"],
+                    "datasets": [{{ "label": "Revenue", "data": [383, 211] }}]
+                  }}
+                }}
+                </Strict Rules>
+            """
+
+    for attempt in range(3):
+        try:
+            res = await skill_model.ainvoke([HumanMessage(content=prompt)])
+            raw_content = res.content
+
+            # 1. 兼容 LangChain 内容块列表解析 (处理 [{"type":"text", "text":"..."}] 的情况)
+            chart_text = ""
+            if isinstance(raw_content, list):
+                for block in raw_content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        chart_text += block.get("text", "")
+            else:
+                chart_text = str(raw_content)
+
+            # 2. 精准提取 JSON (寻找第一对 { 和最后一对 } 之间的内容，过滤大模型的废话)
+            match = re.search(r'(\{.*\})', chart_text, re.DOTALL)
+            if not match:
+                raise ValueError("No JSON object found in the model response.")
+            clean_json_str = match.group(1)
+
+            # 验证 JSON 是否合法
+            chart_json = json.loads(clean_json_str)
+
+            # 3. 工业级做法：POST 到 QuickChart 获取短链接
+            req_data = json.dumps({"chart": chart_json}).encode('utf-8')
+            req = urllib.request.Request(
+                "https://quickchart.io/chart/create",
+                data=req_data,
+                headers={'Content-Type': 'application/json'}
+            )
+
+            with urllib.request.urlopen(req) as response:
+                res_body = json.loads(response.read().decode('utf-8'))
+                if res_body.get("success"):
+                    short_url = res_body.get("url")
+                    # 返回干净清爽的 Markdown 图片链接
+                    return f"[✅ Visualization Generated]\n![{visualization_goal}]({short_url})"
+                else:
+                    raise Exception("QuickChart API failed to generate short URL.")
+
+        except Exception as e:
+            if attempt == 2:
+                return f"[❌ Skill Failed] {str(e)}"
+            prompt += "\nError: Output must be pure JSON."
+
+    return "[❌ Skill Failed]"
+
 # 在这里注册所有可用的复合技能
 AVAILABLE_SKILLS = {
     "quantitative_analysis": quantitative_analysis_skill,
-    "long_doc_mining": long_doc_mining_skill
+    "long_doc_mining": long_doc_mining_skill,
+    "data_visualization": data_visualization_skill
 }
 
 def get_active_skills(assigned_skill_names: List[str]) -> List[Any]:

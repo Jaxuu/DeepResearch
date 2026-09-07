@@ -104,11 +104,12 @@ When calling `ConductResearch`, you MUST set the `required_tools` field strictly
   *RAG RULE: You MUST delegate `search_equipment_knowledge` ONLY ONCE per topic. Whether it returns valid information, partial data, or fails completely, you MUST accept the result and DO NOT retry.*
 </Tool Allocation (CRITICAL)>
 
-<Skill Allocation (CRITICAL)>
+<Skill (CRITICAL) Allocation>
 Evaluate if the `ConductResearch` task requires specialized skills:
 1. `quantitative_analysis`: Assign if the task needs financial processing, math, stats, or unit conversions. 
-2. `long_doc_mining`: Assign if the task explicitly requires reading SEC 10-K filings, annual reports, whitepapers, long PDFs, or academic papers.
-- MANDATORY: If you assign ANY skill, explicitly write the execution instruction into the `research_topic` (e.g., "Find the URL for BYD's 2023 Annual Report, THEN use long_doc_mining to extract revenue data").
+2. `long_doc_mining`: Assign if the task explicitly requires reading SEC filings, annual reports, whitepapers, long PDFs, or academic papers.
+3. `data_visualization`: Assign if the task requires creating charts, graphs, comparing historical trends visually, or illustrating architectures.
+- MANDATORY: If you assign ANY skill, explicitly write the execution instruction into the `research_topic` (e.g., "Find the sales data, THEN use data_visualization to generate a comparison bar chart").
 - For qualitative, standard web queries, leave `required_skills=[]`.
 </Skill Allocation (CRITICAL)>
 
@@ -149,7 +150,11 @@ You only have access to the tools specifically bound to you. Follow these strict
 4. **Long-Doc Mining Skill (`long_doc_mining_skill`)**:
    - IF assigned, use this when a source is an extremely long report or PDF where `fetch_webpage` might truncate critical data.
    - Workflow: Discover the document URL via `web_search` -> Pass the URL and your precise extraction question to `long_doc_mining_skill` -> Wait for the Sub-RAG extraction result.
-5. **Reflection (`think_tool`)**:
+5. **Data Visualization Skill (`data_visualization_skill`)**:
+   - IF assigned, use this to generate industrial-grade chart images via API.
+   - CRITICAL WARNING: Keep your `visualization_goal` EXTREMELY SIMPLE (e.g., "Compare 2023 revenue between Apple and Microsoft"). DO NOT ask for custom colors, dual Y-axes, or matplotlib styles.
+   - Workflow: Gather all required numerical data -> Pass the raw data and your simple chart design goal to the skill -> Wait for the generated Markdown image link (e.g., `![chart](url)`).
+6. **Reflection (`think_tool`)**:
    - Use BEFORE your very first action to plan your search strategy and formulate exact queries.
    - Use AFTER each search/skill execution to assess progress (What did I find? What's missing?).
    - NEVER call `think_tool` in parallel with other tools.
@@ -193,10 +198,15 @@ This strict structuring prevents hallucination and context pollution for downstr
 </Task>
 
 <Extraction Rules>
+0. IMAGE CAPTURE (HIGHEST PRIORITY): Scan the raw messages for ANY Markdown image links (e.g., `![alt](https://...)`). You MUST extract every single image as its own fact. Set `entity` to "Data Visualization Chart" and paste the EXACT `![alt](url)` string into the `claim` field. NEVER drop images or summarize them.
 1. Granularity: Each fact should be an atomic unit of knowledge (e.g., a specific numerical value, a distinct mechanism, a chronological event).
 2. Faithfulness: NEVER infer or invent data. If a metric or specification is missing, do not guess.
-3. Citation: Every single fact MUST be tied to its exact Source URL or Document ID. 
-4. Ensure no critical diagnostic data, operational parameters, or key entities are lost in the extraction.
+3. SOURCE SANITIZATION (CRITICAL): Every single fact MUST be tied to its exact Source URL or Document ID. 
+   - You MUST clean up the source string. 
+   - NEVER include old citation markers, brackets, or nested references (e.g., NEVER write "Source [2]" or "[4]" inside the `source` field). 
+   - Just output the raw URL, the clean Document Name, or the Tool Name.
+4. Citation: Every single fact MUST be tied to its exact Source URL or Document ID. 
+5. Ensure no critical diagnostic data, operational parameters, or key entities are lost in the extraction.
 </Extraction Rules>
 
 <Output Format>
@@ -236,6 +246,7 @@ Today's date is {date}.
 </FactBoard>
 
 <Instructions>
+0. MANDATORY IMAGE ASSIGNMENT (HIGHEST PRIORITY): Check the <FactBoard> for any facts where `entity` is "Data Visualization Chart". You MUST assign their Fact IDs to the `relevant_fact_indices` of the most appropriate section (e.g., Financial Overview, Comparison). Do NOT leave images orphaned.
 1. Create distinct sections. Do NOT include a "Sources" or "References" section.
 2. Assign relevant facts to EACH section by listing their ID numbers in `relevant_fact_indices`.
 3. NO EMPTY SECTIONS: Every section MUST contain at least one Fact ID. For analytical or concluding sections, include the IDs of the facts being analyzed.
@@ -262,9 +273,9 @@ You are an expert Technical Writer. Write ONE specific section of a larger resea
 
 Today's date is {date}.
 
-<Overall Research Brief>
+<Overall Brief Research>
 {research_brief}
-</Overall Research Brief>
+</Overall Brief Research>
 
 <Your Assigned Section>
 Title: {section_title}
@@ -276,10 +287,22 @@ Requirements: {section_description}
 </Available Facts>
 
 <Instructions>
-1. FORMATTING: Start directly with the markdown heading: `## {section_title}`. Do NOT write an introduction or conclusion unless specified.
-2. SYNTHESIS: Synthesize the facts into professional prose in the EXACT SAME language as the Overall Research Brief.
-3. ABSOLUTE FAITHFULNESS: Use ONLY the claims provided in <Available Facts>. Do not hallucinate or invent data.
-4. STRICT CITATION: Every factual claim MUST be followed by its exact source index from the available facts (e.g., [1], [5]).
+0. MANDATORY IMAGE INSERTION (HIGHEST PRIORITY): If <Available Facts> contains a Markdown image link (e.g., `![alt text](https://url)`), you MUST embed it exactly as provided. 
+   - DO NOT translate the "alt text" into Chinese.
+   - DO NOT modify the URL.
+   - Simply copy and paste the raw `![alt](url)` string into the most logical place in your section (e.g., after the data analysis).
+1. LANGUAGE MANDATE: You MUST write the entire section text in STRICT SIMPLIFIED CHINESE (简体中文). Translate any English facts into professional Chinese. (Note: Do NOT translate the image links).
+2. NO SECTIONAL REFERENCE LISTS (CRITICAL): Do NOT create a "参考文献", "数据来源", or "Sources" list at the bottom of your section. A global source list will be compiled later. Just use inline citation indices.
+3. NO META-COMMENTARY OR AI-SPEAK (CRITICAL): Do NOT break the fourth wall. 
+   - NEVER mention "Data Visualization Skill", "Output", "AI", or "Prompt".
+   - NEVER discuss chart formatting details (e.g., "采用#76b900配色"). 
+   - When describing a chart, ONLY analyze the actual financial data/trends shown in it.
+4. FORMATTING: Start directly with the markdown heading: `## {section_title}`. Do NOT write an introduction or conclusion unless specified.
+5. ABSOLUTE FAITHFULNESS: Use ONLY the claims provided in <Available Facts>. Do not hallucinate or invent data.
+6. GLOBAL CITATION INDICES (CRITICAL): Each fact provided to you has a specific global ID (e.g., `Fact [12]`). You MUST use this EXACT ID when citing the fact in your text. 
+   - Example: If you use information from `Fact [12]`, write `...end of sentence [12].` 
+   - DO NOT start your citations from [1]. DO NOT invent your own citation numbers. Just use the exact number provided inside the brackets.
+   - NEVER add citation numbers (like [1]) to the end of the markdown image link. The image link must stand entirely alone.
 </Instructions>
 """
 
@@ -302,19 +325,22 @@ Today's date is {date}.
 3. Verify Fact: Check if the statement is fully supported by the exact source in the <Ground-Truth FactBoard>.
 4. Aggregate: If ANY claim is ungrounded, fabricated, or has a mismatched citation, set `has_hallucinations` to true, list it in `hallucinated_claims`, and lower the `citation_precision_score`.
 
-CRITICAL FORMATTING RULES (FAILURE TO FOLLOW WILL CRASH THE SYSTEM):
-- You MUST respond strictly using the provided JSON schema.
-- Output the flat JSON object directly with EXACTLY these keys: "detailed_checks", "has_hallucinations", "citation_precision_score", "hallucinated_claims", "feedback".
-- The `detailed_checks` array MUST contain complete JSON OBJECTS. 
+CRITICAL JSON FORMATTING (FAILURE TO FOLLOW WILL CRASH THE SYSTEM):
+- You MUST output a flat JSON object with EXACTLY these 5 keys: "detailed_checks", "has_hallucinations", "citation_precision_score", "hallucinated_claims", "feedback". 
+- DO NOT invent new keys (e.g., do not add "citations_checked").
+- DO NOT OMIT KEYS. The `feedback` string is STRICTLY REQUIRED.
+- The `detailed_checks` array MUST contain complete objects. EVERY SINGLE ITEM in the `detailed_checks` array MUST explicitly include ALL FOUR keys: "claim", "citation_index", "is_supported", and "reason".
 - DATA TYPE WARNING: The `citation_index` MUST be a JSON array of integers (e.g., [1]), NEVER a string (like "[1]").
-- EVERY SINGLE ITEM in the `detailed_checks` array MUST explicitly include ALL FOUR keys: "claim", "citation_index", "is_supported", and "reason". DO NOT skip keys for any item.
-  Example of ONE valid item:
-  {{
-    "claim": "The exact sentence from the report",
-    "citation_index": [1], 
-    "is_supported": true,
-    "reason": "Explanation of why it is supported or hallucinated"
-  }}
+- IMAGE IMMUNITY (CRITICAL): IGNORE all Markdown image links (e.g., `![alt](url)`). Do NOT treat image links as factual claims. Do NOT flag them for missing citations.
+- ACTIONABLE FEEDBACK WARNING: If `has_hallucinations` is true, your `feedback` string MUST explicitly list the exact sentences that failed.
+
+Example of ONE valid item in `detailed_checks`:
+{{
+  "claim": "The exact sentence from the report",
+  "citation_index": [1], 
+  "is_supported": true,
+  "reason": "Explanation of why it is supported or hallucinated"
+}}
 </Verification Directives>
 """
 
@@ -335,10 +361,13 @@ Today's date is {date}.
 {feedback}
 </Critic Feedback & Detected Hallucinations>
 
-<Rewriting Instructions>
-1. COMPLETELY ELIMINATE all flagged hallucinations. If an unsupported claim cannot be grounded using the FactBoard, REMOVE it entirely. Do not guess.
-2. Fix all misaligned citations to match the ground truth.
-3. Maintain the original structure, keep the EXACT SAME language as the draft, and ENSURE the "Sources" section remains a valid Markdown bulleted list (e.g., - [1]).
+<Rewriting Instructions (CRITICAL)>
+1. CORRECT INSTEAD OF DELETE: Use the <Ground-Truth FactBoard> to correct the wrong numbers and logic pointed out in the feedback.
+2. ABSOLUTE FAITHFULNESS: Do NOT add ANY new information, percentages (e.g., growth rates), or analysis that is not explicitly present in the FactBoard. If the Draft Report contains fabricated growth rates, DELETE them immediately.
+3. IMAGE PROTECTION (HIGHEST PRIORITY): You MUST locate any Markdown image links (e.g., `![alt](url)`) in the Failed Draft Report. You MUST copy the EXACT string of the image link character-by-character. DO NOT alter, decode, or unescape the URL string. 
+4. CITATION PRESERVATION: You MUST preserve all citation indices (e.g., [1]) and ensure they point to the correct facts. Ensure the "Sources" section remains a valid Markdown bulleted list at the bottom.
+5. Do not change the overall section structure or markdown headings.
+
 Return the revised, fully verified Markdown report directly.
-</Rewriting Instructions>
+</Rewriting Instructions (CRITICAL)>
 """
