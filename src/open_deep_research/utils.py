@@ -197,7 +197,8 @@ async def load_mcp_tools(
 _python_repl = PythonREPL()
 
 @tool(
-    description="A highly capable quantitative analysis skill. Pass in raw data (like financial tables or stats) and a specific calculation goal. It will autonomously write, execute, and debug code to find the answer.")
+    description="A highly capable quantitative analysis skill. Pass in raw data (like financial tables or stats) and a specific calculation goal. It will autonomously write, execute, and debug code to find the answer."
+)
 async def quantitative_analysis_skill(data_context: str, calculation_goal: str, config: RunnableConfig = None) -> str:
     """
     Skill: 动态量化分析沙箱。
@@ -351,11 +352,6 @@ async def long_doc_mining_skill(url: str, extraction_query: str, config: Runnabl
     Use this when you need to create charts, graphs, or diagrams (e.g., comparing revenue, visualizing market share, showing timelines).
     Pass the raw numerical data or relationships as 'data_context', and state exactly what kind of chart you want in 'visualization_goal'."""
 )
-
-
-
-
-@tool
 async def data_visualization_skill(data_context: str, visualization_goal: str, config: RunnableConfig = None) -> str:
     """
     调用外部工业级图表 QuickChart API 生成真实图片链接
@@ -381,8 +377,9 @@ async def data_visualization_skill(data_context: str, visualization_goal: str, c
                 
                 <Strict Rules>
                 1. Output ONLY a valid JSON object representing a Chart.js configuration.
-                2. NO markdown formatting, NO backticks, NO explanations.
-                3. Example of valid output:
+                2. Choose the most appropriate chart type ("bar", "line", "pie", "doughnut", "radar", "scatter") based on the <Goal>.
+                3. NO markdown formatting, NO backticks, NO explanations.
+                4. Example of valid output format (using bar as an example):
                 {{
                   "type": "bar",
                   "data": {{
@@ -429,7 +426,7 @@ async def data_visualization_skill(data_context: str, visualization_goal: str, c
                 if res_body.get("success"):
                     short_url = res_body.get("url")
                     # 返回干净清爽的 Markdown 图片链接
-                    return f"[✅ Visualization Generated]\n![{visualization_goal}]({short_url})"
+                    return f"[✅ Visualization Generated]\n![Data_Visualization_Chart]({short_url})"
                 else:
                     raise Exception("QuickChart API failed to generate short URL.")
 

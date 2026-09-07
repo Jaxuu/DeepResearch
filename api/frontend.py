@@ -1,8 +1,7 @@
-import asyncio
 import re
-import httpx  # 确保导入了 httpx 用于设置超时
+import httpx
 import streamlit as st
-from langgraph_sdk import get_client
+from langgraph_sdk import get_sync_client  # 【修复 1】导入同步客户端
 
 # ================= 页面与主题配置 =================
 st.set_page_config(page_title="Deep Research", layout="wide")
@@ -27,7 +26,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ================= 核心修复：客户端获取工厂 =================
+# ================= 客户端获取工厂 =================
 LANGGRAPH_URL = "http://localhost:2024"
 ASSISTANT_ID = "Deep Researcher"
 
@@ -36,33 +35,34 @@ def get_new_client():
     """
     每次调用时创建一个新的客户端实例，配置 3600 秒超长超时时间防止深度调研中断。
     """
-    timeout_config = httpx.Timeout(3600.0)  # 修改：600 -> 3600
-    return get_client(
+    timeout_config = httpx.Timeout(3600.0)
+    # 【修复 1】使用 get_sync_client 替代 get_client，彻底拥抱 Streamlit 的同步特性
+    return get_sync_client(
         url=LANGGRAPH_URL,
         headers={"Authorization": "Bearer local-dev-token-123"},
         timeout=timeout_config
     )
 
 
-# ================= 工具函数 =================
-async def get_recent_threads():
+# ================= 工具函数 (移除所有 async/await) =================
+def get_recent_threads():
     client = get_new_client()
     try:
-        return await client.threads.search(limit=5)
+        return client.threads.search(limit=5)
     except Exception:
         return []
 
 
-async def create_new_thread(title):
+def create_new_thread(title):
     client = get_new_client()
-    thread = await client.threads.create(metadata={"title": title})
+    thread = client.threads.create(metadata={"title": title})
     return thread["thread_id"]
 
 
-async def fetch_thread_messages(thread_id):
+def fetch_thread_messages(thread_id):
     client = get_new_client()
     try:
-        state = await client.threads.get_state(thread_id)
+        state = client.threads.get_state(thread_id)
         if not state or "values" not in state:
             return []
 
@@ -105,7 +105,9 @@ with st.sidebar:
 
     st.divider()
     st.caption("最近 5 次会话")
-    threads = asyncio.run(get_recent_threads())
+
+    # 直接同步调用，无需 asyncio.run
+    threads = get_recent_threads()
     for t in threads:
         tid = t["thread_id"]
         title = t.get("metadata", {}).get("title", f"会话 {tid[:8]}")
@@ -114,7 +116,7 @@ with st.sidebar:
         if st.button(title, key=tid, use_container_width=True, type=button_type):
             if not is_current:
                 st.session_state.thread_id = tid
-                st.session_state.messages = asyncio.run(fetch_thread_messages(tid))
+                st.session_state.messages = fetch_thread_messages(tid)
                 st.rerun()
 
 # ================= 主页面：聊天交互区 =================
@@ -131,7 +133,8 @@ current_state = None
 if st.session_state.thread_id:
     client = get_new_client()
     try:
-        current_state = asyncio.run(client.threads.get_state(st.session_state.thread_id))
+        # 直接同步调用
+        current_state = client.threads.get_state(st.session_state.thread_id)
         if current_state and current_state.get("next") and "human_review" in current_state["next"]:
             st.session_state.pending_interrupt = True
             tasks = current_state.get("tasks", [])
@@ -142,10 +145,9 @@ if st.session_state.thread_id:
     except Exception:
         pass
 
-# 【核心体验修复 1】：将 is_resuming 的判断提前，如果正在恢复，则立刻销毁/隐藏表单！
 is_resuming = st.session_state.get("resume_payload") is not None
 
-# 渲染干预表单 (仅在流程挂起且没有点击恢复时显示)
+# 渲染干预表单
 if st.session_state.get("pending_interrupt") and not is_resuming:
     st.warning("⏸️ **流程已挂起**：情报检索阶段完成，等待您的审核。")
     facts = st.session_state.interrupt_data.get("facts", [])
@@ -175,7 +177,8 @@ if prompt or is_resuming:
     if prompt and not is_resuming:
         if st.session_state.thread_id is None:
             short_title = prompt[:12] + "..." if len(prompt) > 12 else prompt
-            new_id = asyncio.run(create_new_thread(title=short_title))
+            # 【修复 1】直接同步调用
+            new_id = create_new_thread(title=short_title)
             st.session_state.thread_id = new_id
 
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -188,7 +191,8 @@ if prompt or is_resuming:
         message_placeholder = st.empty()
 
 
-        async def stream_agent_run():
+        # 改为常规同步函数，去掉 async
+        def stream_agent_run():
             if is_resuming:
                 payload = st.session_state.resume_payload
                 st.session_state.resume_payload = None
@@ -214,10 +218,10 @@ if prompt or is_resuming:
             raw_report = ""
             seen_ids = set()
             display_locked_to_final = False
+            token_count = 0  # 用于降低 UI 刷新频率
 
-            async for chunk in stream:
-                # ====== 通道 A：精准节点切换监听 (Updates 模式) ======
-                # ====== 通道 A：精准节点切换监听 (Updates 模式) ======
+            # 去掉 async for，直接使用 for
+            for chunk in stream:
                 if chunk.event == "updates":
                     completed_nodes = list(chunk.data.keys())
                     for node in completed_nodes:
@@ -226,16 +230,12 @@ if prompt or is_resuming:
                         elif node == "write_research_brief":
                             status.update(label="🧠 主管已接管，正在规划战略...", expanded=False)
                             if not display_locked_to_final: message_placeholder.empty()
-
-                        # === 新增：让深度调研核心循环的每一步都反映在 UI 上 ===
                         elif node == "supervisor":
                             status.update(label="🕵️‍♂️ 主管正在调度研究员与分配子任务...", expanded=False)
                         elif node == "researcher":
                             status.update(label="🔍 子研究员正在全网检索与深度阅读...", expanded=False)
                         elif node == "compress_research":
                             status.update(label="🗜️ 子研究员正在压缩与提炼结构化事实库...", expanded=False)
-                        # ==================================================
-
                         elif node == "gen":
                             status.update(label="📑 正在根据情报规划报告大纲...", expanded=False)
                         elif node == "generate_outline":
@@ -244,18 +244,13 @@ if prompt or is_resuming:
                                 message_placeholder.markdown(
                                     "> ⚡ **多智能体并发撰写中**：已将大纲与检索事实切片下发给多个写手节点，正在极速成文中...")
 
-                # ====== 通道 B：解析状态流 ======
                 elif chunk.event == "values":
                     state = chunk.data
-
-                    # 仅保留极其重要的核查警告
                     if "verification_feedback" in state and state["verification_feedback"]:
                         fb_id = str(hash(state["verification_feedback"]))
                         if fb_id not in seen_ids:
                             seen_ids.add(fb_id)
                             status.write("⚠️ **核查未通过**: 发现未证实断言，正在打回重写...")
-
-                    # 【核心体验修复 2】：彻底删除繁杂的工具调用打印日志代码
 
                     if state.get("final_report") and state.get("next") != ["rewrite_report"]:
                         if not display_locked_to_final:
@@ -264,7 +259,6 @@ if prompt or is_resuming:
                             message_placeholder.markdown(final_report)
                             status.update(label="✅ 初稿拼接完成，进行自动化核查...", state="running")
 
-                # ====== 通道 C：解析 Token 流 (中心屏幕打字机) ======
                 elif chunk.event == "messages/partial" and not display_locked_to_final:
                     msg_data = chunk.data[0] if isinstance(chunk.data, list) and len(chunk.data) > 0 else chunk.data
                     metadata = chunk.data[1] if isinstance(chunk.data, list) and len(chunk.data) > 1 else {}
@@ -274,7 +268,6 @@ if prompt or is_resuming:
                         status.update(label="✨ 根据核查意见重写报告...", expanded=False)
                         display_locked_to_final = False
 
-                    # 仅放开主管(思考过程)和重写节点的流式打字
                     if node_name in ["supervisor", "rewrite_report"]:
                         chunk_text = ""
                         content_piece = msg_data.get("content", "")
@@ -289,18 +282,26 @@ if prompt or is_resuming:
 
                         if chunk_text:
                             raw_report += chunk_text
-                            clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_report, flags=re.DOTALL)
+                            token_count += 1
+
+                            # 性能优化：仅在包含 <think> 时才执行消耗性能的正则操作
+                            if "<think>" in raw_report:
+                                clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_report, flags=re.DOTALL)
+                            else:
+                                clean_text = raw_report
+
                             if clean_text.strip():
-                                message_placeholder.markdown(clean_text.strip() + " ▌")
+                                # 性能优化：轻微降频刷新UI，防止 WebSocket 被高频打字机拥塞撑爆
+                                if token_count % 3 == 0 or node_name == "rewrite_report":
+                                    message_placeholder.markdown(clean_text.strip() + " ▌")
                                 if node_name == "rewrite_report":
                                     final_report = clean_text.strip()
 
-            # ====== 流式结束后的状态结算 ======
             if final_report:
                 message_placeholder.markdown(final_report)
                 status.update(label="✅ 深度调研报告已生成", state="complete", expanded=False)
             else:
-                final_state = await client.threads.get_state(st.session_state.thread_id)
+                final_state = client.threads.get_state(st.session_state.thread_id)
                 if final_state and final_state.get("next") and "human_review" in final_state["next"]:
                     status.update(label="⏸️ 检索已就绪，等待您的审批指令...", state="complete", expanded=False)
                     st.session_state.pending_interrupt = True
@@ -310,10 +311,9 @@ if prompt or is_resuming:
             return final_report
 
 
-        # 获取最终报告
-        final_rep = asyncio.run(stream_agent_run())
+        # 直接同步调用执行
+        final_rep = stream_agent_run()
 
-        # 【核心体验修复 3】：将最终生成的报告写入历史，确保下次刷新不丢失
         if final_rep:
             st.session_state.messages.append({"role": "assistant", "content": final_rep})
 
