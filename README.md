@@ -1,53 +1,121 @@
-# 🔬 Open Deep Research
+# 🔬 Open Deep Research · 工业级魔改版
 
-<img width="1388" height="298" alt="full_diagram" src="https://github.com/user-attachments/assets/12a2371b-8be2-4219-9b48-90503eb43c69" />
+> 本项目基于 [langchain-ai/open_deep_research](https://github.com/langchain-ai/open_deep_research) 深度改造，在保留原有 Supervisor–Researcher 多智能体骨架的基础上，围绕**证据链可信、推理成本可控、成文质量可核查**三个目标重写了核心链路，并新增了 Streamlit 流式前端与人在回路（HITL）干预能力。
 
-Deep research has broken out as one of the most popular agent applications. This is a simple, configurable, fully open source deep research agent that works across many model providers, search tools, and MCP servers. It's performance is on par with many popular deep research agents ([see Deep Research Bench leaderboard](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard)).
+## ✨ 相比原版的核心魔改点
 
-<img width="817" height="666" alt="Screenshot 2025-07-13 at 11 21 12 PM" src="https://github.com/user-attachments/assets/052f2ed3-c664-4a4f-8ec2-074349dcaa3f" />
+| # | 魔改方向 | 说明 |
+|---|---------|------|
+| 1 | **FactBoard 结构化事实看板** | 用原子化的 `Fact(entity, claim, source)` 三元组取代原版的自由文本笔记，压缩阶段强制以 `json_mode` 结构化输出，并内置基于 claim 的去重归约器，从源头抑制幻觉与上下文污染 |
+| 2 | **信息增益动态剪枝与熔断** | 新增 `evaluate_research` 节点：每轮并发检索后统计**全新事实数**，连续 1 轮零增益则向 Supervisor 注入系统警告，连续 2 轮零增益则强制熔断、提早进入成文阶段，大幅节省 Token 开销 |
+| 3 | **Supervisor 记忆折叠** | 新增 `fold_memory` 节点：当主管消息数超过 10 条时，调用压缩模型将中间历史折叠为一条"长期记忆胶囊"（保留初始设定与最近一次决策现场），防止长调研任务上下文爆炸 |
+| 4 | **Critic 对抗核查 + 定向重写闭环** | 新增 `report_verifier` / `rewrite_report` 节点：核查模型逐句比对报告断言与 FactBoard，输出引用准确度评分与幻觉清单；发现幻觉则打回定向重写，最多循环 `max_verification_retries`（默认 2）次 |
+| 5 | **Map-Reduce 分层成文** | 原版单节点写报告改为三段式：`generate_outline`（全局大纲 + 按 Fact ID 切片分发，含遗漏事实兜底拦截）→ `write_section`（多写手节点并发成文）→ `assemble_report`（按大纲顺序拼装 + 生成全局统一参考文献） |
+| 6 | **人在回路（HITL）干预** | 新增 `human_review` 节点：检索阶段结束后通过 `interrupt` 挂起流程，用户审核 FactBoard 后可直接放行，或填写干预指令打回 Supervisor 继续调研（同时重置熔断计数器） |
+| 7 | **技能注册表（Skills）** | Supervisor 派发任务时可按需分配专业技能，研究员子图动态挂载：`quantitative_analysis`（PythonREPL 量化沙箱）、`long_doc_mining`（长文 BM25 子 RAG）、`data_visualization`（Chart.js + QuickChart 图表生成），详见下文技能表 |
+| 8 | **动态工具路由与状态隔离** | `ConductResearch` 新增 `required_tools` / `required_skills` 字段，每个研究员只挂载被分配的武器（`think_tool` 恒定保留）；Supervisor 内部决策消息与外层用户对话严格隔离，超过并发上限的任务被显式拒绝而非静默丢弃 |
+| 9 | **公网检索架构解耦** | `web_search`（Tavily）改为**批量查询、仅返回摘要片段**；全文获取剥离到 `fetch_webpage`（基于 Jina Reader `r.jina.ai`，约 15000 字符安全截断）；超长文档交由 `long_doc_mining` 技能做全文 BM25 召回，不再受截断限制 |
+| 10 | **上下文瘦身与主动 GC** | 彻底移除 `raw_notes` 冗余状态；研究员压缩完成后立即下发 `RemoveMessage` 销毁子图内的原始消息，防止 Checkpointer 状态膨胀 |
+| 11 | **模型配置体系重构** | 角色模型由 `summarization/research/compression/final_report` 四件套改为 **`supervisor / research / compression / final_report / verifier` 五角色**，全部经环境变量注入；代码自动为模型名拼接 `openai:` 前缀，配合 `OPENAI_BASE_URL` 可无缝接入任意 OpenAI 兼容网关（本仓库默认对接阿里云百炼 DashScope，运行 Kimi / DeepSeek / Qwen 等模型） |
+| 12 | **多供应商 Token 超限检测** | 超限识别新增 Qwen/DashScope 错误特征，与 OpenAI / Anthropic / Gemini 并列；压缩阶段超限时自动截断历史并重试 |
+| 13 | **Streamlit 流式前端** | 新增 `api/frontend.py`：三通道流式渲染（values / messages / updates）、节点级状态机提示、HITL 审核表单、`<think>` 思考内容过滤、打字机降频刷新、最近 5 条会话历史管理 |
+| 14 | **MCP 纯 SSE 微服务化（预留）** | `load_mcp_tools` 重写为基于 `MultiServerMCPClient` 的 SSE 长连接单例（工业 RAG `:8080` / ERP 数据库 `:8001`），当前在 `get_all_tools` 中默认注释关闭，需要私有数据源时取消注释即可启用 |
 
-### 🔥 Recent Updates
+> 原版 `src/legacy/`（Plan-and-Execute 工作流与旧版多智能体实现）已在本仓库中移除。
 
-**August 14, 2025**: See our free course [here](https://academy.langchain.com/courses/deep-research-with-langgraph) (and course repo [here](https://github.com/langchain-ai/deep_research_from_scratch)) on building open deep research.
+## 🗺️ 运行架构
 
-**August 7, 2025**: Added GPT-5 and updated the Deep Research Bench evaluation w/ GPT-5 results.
+```mermaid
+flowchart TD
+    S((开始)) --> A[clarify_with_user<br/>需求澄清]
+    A -->|范围不清| E1((结束: 向用户反问))
+    A -->|范围明确| B[write_research_brief<br/>生成结构化调研简报]
+    B --> C[supervisor<br/>主管战略调度]
+    C --> D[supervisor_tools<br/>任务派发 / 溢出拒绝]
+    D -->|Send x N 并发| R
 
-**August 2, 2025**: Achieved #6 ranking on the [Deep Research Bench Leaderboard](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard) with an overall score of 0.4344. 
+    subgraph R [researcher_subgraph 研究员子图]
+        R1[researcher<br/>聚焦调研] --> R2[researcher_tools<br/>工具并行执行]
+        R2 -->|未达上限| R1
+        R2 -->|完成| R3[compress_research<br/>FactBoard 结构化提取 + GC]
+    end
 
-**July 30, 2025**: Read about the evolution from our original implementations to the current version in our [blog post](https://rlancemartin.github.io/2025/07/30/bitter_lesson/).
+    R --> F[evaluate_research<br/>信息增益评估]
+    F -->|连续 2 轮零增益: 熔断| H
+    F -->|增益正常| G[fold_memory<br/>主管记忆折叠]
+    G --> C
+    D -->|ResearchComplete / 迭代达上限| H[human_review<br/>HITL 人工审核 FactBoard]
+    H -->|打回 + 干预指令| C
+    H -->|审核通过| I[generate_outline<br/>大纲生成 + 事实切片路由]
+    I -->|Send 并发| J[write_section<br/>多写手并发成文]
+    J --> K[assemble_report<br/>按序拼装 + 统一参考文献]
+    K --> L[report_verifier<br/>Critic 对抗核查]
+    L -->|发现幻觉且有重试预算| M[rewrite_report<br/>定向重写]
+    M --> L
+    L -->|通过 / 重试达上限| E2((结束: 输出最终研报))
+```
 
-**July 16, 2025**: Read more in our [blog](https://blog.langchain.com/open-deep-research/) and watch our [video](https://www.youtube.com/watch?v=agGiWUpxkhg) for a quick overview.
+## 🚀 快速启动
 
-### 🚀 Quickstart
+### 1. 环境准备
 
-1. Clone the repository and activate a virtual environment:
+要求 Python ≥ 3.10（`langgraph.json` 固定使用 3.11）：
+
 ```bash
-git clone https://github.com/langchain-ai/open_deep_research.git
+git clone <your-repo-url>
 cd open_deep_research
-uv venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
-
-2. Install dependencies:
-```bash
+uv venv --python 3.11
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 uv sync
-# or
-uv pip install -r pyproject.toml
 ```
 
-3. Set up your `.env` file to customize the environment variables (for model selection, search tools, and other configuration settings):
+魔改新增的运行时依赖（已包含在 `pyproject.toml`，`uv sync` 会自动安装）：
+
+- `langchain-experimental`：提供 `PythonREPL`，支撑量化分析沙箱技能
+- `rank-bm25`：提供 BM25 检索，支撑长文挖掘技能
+
+若需要使用 Streamlit 前端，需额外安装（未纳入主依赖）：
+
+```bash
+uv pip install streamlit
+# langgraph-sdk 已随 langgraph-cli[inmem] 一并安装
+```
+
+### 2. 配置环境变量
+
+复制模板后按下表补全（⚠️ 注意：仓库内 `.env.example` 为原版模板，**完整清单以本节为准**）：
+
 ```bash
 cp .env.example .env
 ```
 
-4. Launch agent with the LangGraph server locally:
+| 环境变量 | 来源 | 说明 |
+|---------|------|------|
+| `OPENAI_API_KEY` | 原版 | 主 API Key。由于所有模型名会被自动加上 `openai:` 前缀，此处应填写**兼容网关**的 Key（默认为 DashScope Key） |
+| `OPENAI_BASE_URL` / `OPENAI_API_BASE` | 🆕 魔改新增 | OpenAI 兼容网关地址，例如 `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `SUPERVISOR_MODEL` | 🆕 魔改新增 | 主管模型（澄清、简报、调度），如 `kimi-k2.5` |
+| `RESEARCH_MODEL` | 原版 | 研究员模型（检索与工具调用），如 `deepseek-v4-pro` |
+| `COMPRESSION_MODEL` | 原版 | 压缩模型（FactBoard 提取、记忆折叠、技能内部推理），如 `deepseek-v3.1` |
+| `WRITER_MODEL` | 原版 | 成文模型（大纲、章节撰写、重写），如 `kimi-k2.6` |
+| `VERIFIER_MODEL` | 🆕 魔改新增 | 核查模型（Critic 引用核验），如 `qwen-plus-character` |
+| `TAVILY_API_KEY` | 原版 | 默认搜索源 Tavily 的 Key |
+| `JINA_API_KEY` | 🆕 魔改新增（可选） | `fetch_webpage` 与 `long_doc_mining` 走 Jina Reader，不配也可匿名访问，配置后更稳定 |
+| `DASHSCOPE_API_KEY` | 🆕 魔改新增（预留） | 当 `GET_API_KEYS_FROM_CONFIG=true` 或模型名以 `qwen` 开头且未加前缀时用于鉴权映射 |
+| `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` | 原版 | 使用对应原生搜索或模型时需要 |
+| `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` / `LANGSMITH_ENDPOINT` / `LANGSMITH_PROJECT` | 原版（可选） | LangSmith 链路追踪 |
+| `SUPABASE_KEY` / `SUPABASE_URL` / `GET_API_KEYS_FROM_CONFIG` | 原版 | 仅 Open Agent Platform 生产部署需要，本地开发保持 `false` |
+
+> 模型名只需填写裸名称（如 `kimi-k2.5`），`Configuration.from_runnable_config` 会自动拼接 `openai:` 前缀并经 `OPENAI_BASE_URL` 路由。`.env` 由 `configuration.py` 以 `override=True` 加载，会覆盖同名 Shell 环境变量。
+
+### 3. 启动后端（LangGraph Server）
 
 ```bash
-# Install dependencies and start the LangGraph server
+langgraph dev --allow-blocking
+# 或使用免安装方式：
 uvx --refresh --from "langgraph-cli[inmem]" --with-editable . --python 3.11 langgraph dev --allow-blocking
 ```
 
-This will open the LangGraph Studio UI in your browser.
+启动后可用入口：
 
 ```
 - 🚀 API: http://127.0.0.1:2024
@@ -55,95 +123,115 @@ This will open the LangGraph Studio UI in your browser.
 - 📚 API Docs: http://127.0.0.1:2024/docs
 ```
 
-Ask a question in the `messages` input field and click `Submit`. Select different configuration in the "Manage Assistants" tab.
-
-### ⚙️ Configurations
-
-#### LLM :brain:
-
-Open Deep Research supports a wide range of LLM providers via the [init_chat_model() API](https://python.langchain.com/docs/how_to/chat_models_universal_init/). It uses LLMs for a few different tasks. See the below model fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be accessed via the LangGraph Studio UI. 
-
-- **Summarization** (default: `openai:gpt-4.1-mini`): Summarizes search API results
-- **Research** (default: `openai:gpt-4.1`): Power the search agent
-- **Compression** (default: `openai:gpt-4.1`): Compresses research findings
-- **Final Report Model** (default: `openai:gpt-4.1`): Write the final report
-
-> Note: the selected model will need to support [structured outputs](https://python.langchain.com/docs/integrations/chat/) and [tool calling](https://python.langchain.com/docs/how_to/tool_calling/).
-
-> Note: For OpenRouter: Follow [this guide](https://github.com/langchain-ai/open_deep_research/issues/75#issuecomment-2811472408) and for local models via Ollama  see [setup instructions](https://github.com/langchain-ai/open_deep_research/issues/65#issuecomment-2743586318).
-
-#### Search API :mag:
-
-Open Deep Research supports a wide range of search tools. By default it uses the [Tavily](https://www.tavily.com/) search API. Has full MCP compatibility and work native web search for Anthropic and OpenAI. See the `search_api` and `mcp_config` fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be accessed via the LangGraph Studio UI. 
-
-#### Other 
-
-See the fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) for various other settings to customize the behavior of Open Deep Research. 
-
-### 📊 Evaluation
-
-Open Deep Research is configured for evaluation with [Deep Research Bench](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard). This benchmark has 100 PhD-level research tasks (50 English, 50 Chinese), crafted by domain experts across 22 fields (e.g., Science & Tech, Business & Finance) to mirror real-world deep-research needs. It has 2 evaluation metrics, but the leaderboard is based on the RACE score. This uses LLM-as-a-judge (Gemini) to evaluate research reports against a golden set of reports compiled by experts across a set of metrics.
-
-#### Usage
-
-> Warning: Running across the 100 examples can cost ~$20-$100 depending on the model selection.
-
-The dataset is available on [LangSmith via this link](https://smith.langchain.com/public/c5e7a6ad-fdba-478c-88e6-3a388459ce8b/d). To kick off evaluation, run the following command:
+### 4. 启动前端（🆕 Streamlit 魔改新增）
 
 ```bash
-# Run comprehensive evaluation on LangSmith datasets
+streamlit run api/frontend.py
+```
+
+前端默认连接 `http://localhost:2024` 上的 `Deep Researcher` 图，并以固定开发 Token（`local-dev-token-123`，已在 `src/security/auth.py` 中放行，**仅限本地联调**）完成鉴权。如需修改地址或 Token，编辑 `api/frontend.py` 顶部常量即可。
+
+### 5. 使用流程
+
+1. 在输入框提交调研需求；若开启了 `allow_clarification`（默认开启），范围不清时智能体会先反问澄清。
+2. 主管并发派发研究员，前端状态面板实时展示"调度 → 检索 → 压缩 → 大纲 → 并发成文"各阶段。
+3. **检索阶段结束后流程必定在 `human_review` 挂起**：页面会展开 FactBoard 事实清单，你可以
+   - 点击「✅ 事实无误，直接生成报告」放行；或
+   - 填写干预指令后点击「🔄 打回节点，继续调研」，指令会作为 `[HUMAN INTERVENTION]` 消息注入 Supervisor 并重置熔断计数。
+4. 报告经 Critic 核查（未通过自动重写）后，最终 Markdown 研报渲染在对话区，文末附全局统一参考文献。
+
+通过 SDK/API 恢复挂起流程时，`command` 载荷为 `{"resume": {"action": "continue"}}` 或 `{"resume": {"action": "feedback", "feedback": "..."}}`（也兼容纯字符串输入）。
+
+## ⚙️ 配置详解
+
+所有配置项定义在 [configuration.py](src/open_deep_research/configuration.py)，可经环境变量、LangGraph Studio「Manage Assistants」或 `configurable` 运行时下发。
+
+### 模型角色（🆕 五角色体系）
+
+| 角色字段                      | 环境变量 | 默认 max_tokens | 承担节点             |
+|---------------------------|---------|----------------|------------------|
+| `supervisor_model`        | `SUPERVISOR_MODEL` | 8192 | 需求澄清、简报生成、主管调度   |
+| `research_model`          | `RESEARCH_MODEL` | 10000 | 研究员检索与工具调用       |
+| `compression_model`       | `COMPRESSION_MODEL` | 8192 | FactBoard 提取、记忆折叠 |
+| `writer_model`            | `WRITER_MODEL` | 8192 | 大纲生成、章节撰写、报告重写   |
+| `verifier_model`          | `VERIFIER_MODEL` | 4000 | Critic 对抗核查      |
+| `logical_reasoning_model` | `LOGICAL_REASONING_MODEL` | 10000 | Critic 对抗核查、各技能内部推理    |
+
+
+> 原版 `summarization_model` 已移除（评测脚本已同步更新）。所选模型需支持工具调用；结构化输出统一走 `json_mode`，对不支持原生 structured output 的兼容网关模型更友好。
+
+### 调研行为参数
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `allow_clarification` | `True` | 允许在调研开始前向用户反问澄清 |
+| `max_concurrent_research_units` | `3` | 单轮最大并发研究员数，溢出任务收到显式错误回执 |
+| `max_researcher_iterations` | `6` | 主管派发轮数安全锁，达到上限强制结束调研 |
+| `max_react_tool_calls` | `10` | 单个研究员的工具调用轮数上限 |
+| `max_structured_output_retries` | `3` | 结构化输出解析失败的重试次数 |
+| `max_verification_retries` | `2` 🆕 | 「核查 → 重写」闭环的最大循环次数 |
+| `search_api` | `tavily` | 可选 `tavily` / `openai`（原生搜索）/ `anthropic`（原生搜索）/ `none` |
+| `mcp_config` / `mcp_prompt` | `None` | MCP 服务器配置与附加提示（当前 SSE 接入为预留能力，默认关闭） |
+
+### 工具与技能分配
+
+Supervisor 通过 `ConductResearch` 的 `required_tools` / `required_skills` 字段为每个研究员精准挂载能力：
+
+**基础工具（`required_tools` 可选项）**
+
+| 工具名 | 说明 |
+|-------|------|
+| `web_search` | Tavily 批量检索，支持多 query 并发与去重，**仅返回标题/URL/摘要片段** |
+| `fetch_webpage` | Jina Reader 提取网页全文为 Markdown，约 15000 字符安全截断 |
+| `search_equipment_knowledge` | 私有 RAG 知识库检索（MCP SSE `:8080`，预留，默认关闭） |
+| `query_erp_database` | 结构化 ERP 数据库查询（MCP SSE `:8001`，预留，默认关闭） |
+| `think_tool` | 战略反思工具，恒定挂载，不可剥离 |
+
+**专业技能（`required_skills` 可选项，注册于 `utils.AVAILABLE_SKILLS`）**
+
+| 技能名 | 实现机制 | 适用场景 |
+|-------|---------|---------|
+| `quantitative_analysis` | 压缩模型生成 Python 代码 → `PythonREPL` 沙箱执行 → 结果校验 → 出错自愈重试（最多 5 轮） | 财报比率、统计指标等需要精确计算的场景 |
+| `long_doc_mining` | Jina Reader 无截断全文 → 2500/300 滑窗切片 → 本地 BM25 召回 Top-5（零 Token 成本）→ 小模型精准提纯 | 年报、招股书、长篇论文等超出 `fetch_webpage` 截断限制的文档 |
+| `data_visualization` | 小模型输出 Chart.js JSON 配置 → QuickChart API 生成短链图片 | 营收对比、市占率、时间线等图表需求 |
+
+图表链接具备全链路防丢失保护：压缩阶段以最高优先级将 Markdown 图片物理提取为独立 Fact，章节撰写与报告重写阶段若检测到图表被模型遗漏，会强制回插正文。
+
+## 📊 评测
+
+评测脚本位于 `tests/`，对接 [Deep Research Bench](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard)（100 个博士级调研任务，RACE 评分）。魔改后已同步移除脚本中的 `summarization_model` 相关配置。
+
+```bash
+# 在 LangSmith 数据集上运行完整评测
 python tests/run_evaluate.py
+
+# 导出评测结果为可提交的 JSONL
+python tests/extract_langsmith_data.py --project-name "YOUR_EXPERIMENT_NAME" --model-name "your-model-name" --dataset-name "deep_research_bench"
 ```
 
-This will provide a link to a LangSmith experiment, which will have a name `YOUR_EXPERIMENT_NAME`. Once this is done, extract the results to a JSONL file that can be submitted to the Deep Research Bench.
+> 警告：跑完全部 100 个样例的成本约为 $20–$100（取决于模型选择）。原版的评测结果与排行榜记录请参阅[上游仓库](https://github.com/langchain-ai/open_deep_research)。
 
-```bash
-python tests/extract_langsmith_data.py --project-name "YOUR_EXPERIMENT_NAME" --model-name "you-model-name" --dataset-name "deep_research_bench"
+## 📁 项目结构
+
+```
+open_deep_research/
+├── api/
+│   └── frontend.py            # 🆕 Streamlit 流式前端（三通道流式渲染 + HITL 审核 UI）
+├── src/
+│   ├── open_deep_research/
+│   │   ├── deep_researcher.py # LangGraph 主图：主工作流 + 主管子图 + 研究员子图
+│   │   ├── configuration.py   # 五角色模型与调研行为配置
+│   │   ├── state.py           # 状态定义与结构化输出模型（Fact / FactBoard / VerificationReport / ReportOutline 等）
+│   │   ├── prompts.py         # 全量提示词模板（含记忆折叠、大纲生成、核查、重写等新增模板）
+│   │   └── utils.py           # 搜索工具、技能注册表、MCP SSE 客户端、Token 超限检测
+│   └── security/
+│       └── auth.py            # LangGraph 部署鉴权（含本地开发 Token 放行）
+├── tests/                     # Deep Research Bench 评测脚本
+├── examples/                  # 示例研报（arXiv / PubMed / 推理市场分析）
+├── langgraph.json             # LangGraph 图入口配置（Deep Researcher）
+└── pyproject.toml             # 依赖与构建配置
 ```
 
-This creates `tests/expt_results/deep_research_bench_model-name.jsonl` with the required format. Move the generated JSONL file to a local clone of the Deep Research Bench repository and follow their [Quick Start guide](https://github.com/Ayanami0730/deep_research_bench?tab=readme-ov-file#quick-start) for evaluation submission.
+## 📄 License
 
-#### Results 
-
-| Name | Commit | Summarization | Research | Compression | Total Cost | Total Tokens | RACE Score | Experiment |
-|------|--------|---------------|----------|-------------|------------|--------------|------------|------------|
-| GPT-5 | [ca3951d](https://github.com/langchain-ai/open_deep_research/pull/168/commits) | openai:gpt-4.1-mini | openai:gpt-5 | openai:gpt-4.1 |  | 204,640,896 | 0.4943 | [Link](https://smith.langchain.com/o/ebbaf2eb-769b-4505-aca2-d11de10372a4/datasets/6e4766ca-613c-4bda-8bde-f64f0422bbf3/compare?selectedSessions=4d5941c8-69ce-4f3d-8b3e-e3c99dfbd4cc&baseline=undefined) |
-| Defaults | [6532a41](https://github.com/langchain-ai/open_deep_research/commit/6532a4176a93cc9bb2102b3d825dcefa560c85d9) | openai:gpt-4.1-mini | openai:gpt-4.1 | openai:gpt-4.1 | $45.98 | 58,015,332 | 0.4309 | [Link](https://smith.langchain.com/o/ebbaf2eb-769b-4505-aca2-d11de10372a4/datasets/6e4766ca-6[…]ons=cf4355d7-6347-47e2-a774-484f290e79bc&baseline=undefined) |
-| Claude Sonnet 4 | [f877ea9](https://github.com/langchain-ai/open_deep_research/pull/163/commits/f877ea93641680879c420ea991e998b47aab9bcc) | openai:gpt-4.1-mini | anthropic:claude-sonnet-4-20250514 | openai:gpt-4.1 | $187.09 | 138,917,050 | 0.4401 | [Link](https://smith.langchain.com/o/ebbaf2eb-769b-4505-aca2-d11de10372a4/datasets/6e4766ca-6[…]ons=04f6002d-6080-4759-bcf5-9a52e57449ea&baseline=undefined) |
-| Deep Research Bench Submission | [c0a160b](https://github.com/langchain-ai/open_deep_research/commit/c0a160b57a9b5ecd4b8217c3811a14d8eff97f72) | openai:gpt-4.1-nano | openai:gpt-4.1 | openai:gpt-4.1 | $87.83 | 207,005,549 | 0.4344 | [Link](https://smith.langchain.com/o/ebbaf2eb-769b-4505-aca2-d11de10372a4/datasets/6e4766ca-6[…]ons=e6647f74-ad2f-4cb9-887e-acb38b5f73c0&baseline=undefined) |
-
-### 🚀 Deployments and Usage
-
-#### LangGraph Studio
-
-Follow the [quickstart](#-quickstart) to start LangGraph server locally and test the agent out on LangGraph Studio.
-
-#### Hosted deployment
- 
-You can easily deploy to [LangGraph Platform](https://langchain-ai.github.io/langgraph/concepts/#deployment-options). 
-
-#### Open Agent Platform
-
-Open Agent Platform (OAP) is a UI from which non-technical users can build and configure their own agents. OAP is great for allowing users to configure the Deep Researcher with different MCP tools and search APIs that are best suited to their needs and the problems that they want to solve.
-
-We've deployed Open Deep Research to our public demo instance of OAP. All you need to do is add your API Keys, and you can test out the Deep Researcher for yourself! Try it out [here](https://oap.langchain.com)
-
-You can also deploy your own instance of OAP, and make your own custom agents (like Deep Researcher) available on it to your users.
-1. [Deploy Open Agent Platform](https://docs.oap.langchain.com/quickstart)
-2. [Add Deep Researcher to OAP](https://docs.oap.langchain.com/setup/agents)
-
-### Legacy Implementations 🏛️
-
-The `src/legacy/` folder contains two earlier implementations that provide alternative approaches to automated research. They are less performant than the current implementation, but provide alternative ideas understanding the different approaches to deep research.
-
-#### 1. Workflow Implementation (`legacy/graph.py`)
-- **Plan-and-Execute**: Structured workflow with human-in-the-loop planning
-- **Sequential Processing**: Creates sections one by one with reflection
-- **Interactive Control**: Allows feedback and approval of report plans
-- **Quality Focused**: Emphasizes accuracy through iterative refinement
-
-#### 2. Multi-Agent Implementation (`legacy/multi_agent.py`)  
-- **Supervisor-Researcher Architecture**: Coordinated multi-agent system
-- **Parallel Processing**: Multiple researchers work simultaneously
-- **Speed Optimized**: Faster report generation through concurrency
-- **MCP Support**: Extensive Model Context Protocol integration
+MIT，与上游保持一致。

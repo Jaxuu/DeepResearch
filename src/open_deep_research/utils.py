@@ -6,6 +6,8 @@ import logging
 import os
 import httpx
 import warnings
+import tempfile
+import requests
 import re
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
@@ -34,6 +36,7 @@ from langchain_core.documents import Document
 from langchain.chat_models import init_chat_model
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_experimental.utilities import PythonREPL
+from langchain_community.document_loaders import PyPDFLoader
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.state import ResearchComplete
@@ -41,6 +44,7 @@ from open_deep_research.state import ResearchComplete
 ##########################
 # Tavily 搜索工具组件
 ##########################
+
 @tool(description="Search the web for news, facts, and public data. Returns titles, URLs, and concise snippets.")
 async def web_search(
         queries: List[str],
@@ -89,7 +93,8 @@ async def fetch_webpage(url: str) -> str:
     jina_url = f"https://r.jina.ai/{url}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "X-Timeout": "15"  # 15秒超时设置
+        "X-Timeout": "15",  # 15秒超时设置
+        "X-Return-Format": "markdown"  # 明确要求标准 Markdown
     }
 
     # 若在环境变量中配置了 JINA_API_KEY，则自动携带；没有配置也能直接免密访问
@@ -103,14 +108,18 @@ async def fetch_webpage(url: str) -> str:
             if response.status_code == 200:
                 content = response.text
                 # 安全截断，防止目标网页过长（保留约 15000 字符，足够提取长篇专业数据）
-                if len(content) > 15000:
-                    content = content[:15000] + "\n\n[...正文超长，已安全截断...]"
+                if len(content) > 50000:
+                    content = content[:50000] + "\n\n[...正文超长，已安全截断...]"
                 return content
             else:
                 return f"Failed to fetch content from {url}. Status code: {response.status_code}"
     except Exception as e:
         return f"Error reading URL {url}: {str(e)}"
 
+
+##########################
+# 思考工具
+##########################
 
 @tool(description="Strategic reflection tool for research planning")
 def think_tool(reflection: str) -> str:
@@ -140,54 +149,112 @@ def think_tool(reflection: str) -> str:
     return f"Reflection recorded: {reflection}"
 
 ##########################
-# MCP 工具组件
+# 基础工具组件
 ##########################
-# 模拟企业级架构中的“连接池单例”
-# 保证跨越 Supervisor 和 Sub-agent 多个节点时，网络通道持久存活
-_mcp_client = None
 
-async def load_mcp_tools(
-        config,
-        existing_tool_names: set[str],
-):
-    """加载标准的远端 MCP 工具 (基于官方 MultiServerMCPClient 封装)"""
-    global _mcp_client
+async def get_search_tool(search_api: SearchAPI):
+    """根据指定的 API 提供商配置并返回搜索工具。
 
-    # 混合 MCP 配置字典
-    mcp_config = {
-        "industrial_rag": {
-            "transport": "sse",
-            "url": "http://127.0.0.1:8080/sse"
-        },
-        "sqlite_db": {
-            "transport": "sse",
-            "url": "http://127.0.0.1:8001/sse"
+    参数:
+        search_api: 搜索 API 提供商（Anthropic、OpenAI、Tavily 或 None）
+
+    返回:
+        指定提供商的已配置搜索工具对象列表
+    """
+    if search_api == SearchAPI.ANTHROPIC:
+        # 带使用次数限制的 Anthropic 原生网络搜索
+        return [{
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5
+        }]
+
+    elif search_api == SearchAPI.OPENAI:
+        # OpenAI 原生网络搜索预览功能
+        return [{"type": "web_search_preview"}]
+
+    elif search_api == SearchAPI.TAVILY:
+        # 配置带元数据的 Tavily 搜索工具
+        search_tool = web_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}),
+            "type": "search",
+            "name": "web_search"
         }
-    }
+        return [search_tool]
 
-    try:
-        # 如果是第一次请求，初始化官方高阶客户端
-        if _mcp_client is None:
-            _mcp_client = MultiServerMCPClient(mcp_config)
-            # 对于 0.1.0 版本的 langchain-mcp-adapters，直接使用其内部 session
-
-        # 一行代码拉取所有可用工具
-        available_tools = await _mcp_client.get_tools()
-
-        # 调试信息：确保拿到工具
-        print(f"\n[🔌 MCP 挂载成功 (SSE 模式)] 获取私有库工具: {[t.name for t in available_tools]}")
-
-    except Exception as e:
-        print(f"\n[⚠️ MCP 连接失败] 请检查 Server 是否在 8080 端口启动: {e}")
+    elif search_api == SearchAPI.NONE:
+        # 未配置任何搜索功能
         return []
 
-    # 过滤重复工具
-    configured_tools = []
-    for mcp_tool in available_tools:
-        if mcp_tool.name not in existing_tool_names:
-            configured_tools.append(mcp_tool)
+    # 未知搜索 API 类型的默认兜底处理
+    return []
 
-    return configured_tools
+async def get_all_tools(config: RunnableConfig):
+    """组装完整工具包，包含研究、搜索和 MCP 工具。
+
+    参数:
+        config: 指定搜索 API 和 MCP 设置的运行时配置
+
+    返回:
+        用于研究操作的所有已配置且可用的工具列表
+    """
+    # 首先添加核心研究工具
+    tools = [tool(ResearchComplete), think_tool]
+
+    # 添加配置的搜索工具
+    configurable = Configuration.from_runnable_config(config)
+    search_api = SearchAPI(get_config_value(configurable.search_api))
+
+    # 若选择 Tavily，则挂载新改造的 web_search
+    if search_api == SearchAPI.TAVILY:
+        tools.append(web_search)
+        tools.append(fetch_webpage)
+    else:
+        search_tools = await get_search_tool(search_api)
+        tools.extend(search_tools)
+
+    return tools
+
+##########################
+# MCP 工具组件
+##########################
+
+# 模拟企业级架构中的“连接池单例”，保证跨越 Supervisor 和 Sub-agent 多个节点时，网络通道持久存活
+_mcp_client = None
+
+async def get_or_create_mcp_client():
+    """获取或初始化全局 MCP 客户端单例"""
+    global _mcp_client
+    if _mcp_client is None:
+        # 这里配置所有你需要接入的 MCP Server（无论内部还是第三方）
+        mcp_config = {
+            "industrial_rag": {"transport": "sse", "url": "http://127.0.0.1:8080/sse"},
+            "sqlite_db": {"transport": "sse", "url": "http://127.0.0.1:8001/sse"}
+        }
+        _mcp_client = MultiServerMCPClient(mcp_config)
+    return _mcp_client
+
+@tool(description="Search the dynamic Tool Registry for extended workspace tools and third-party integrations (e.g., Databases, GitHub, RAG, Slack). Pass a natural language query describing the capabilities you need.")
+async def search_tools_catalog(query: str, config: RunnableConfig = None) -> str:
+    """动态工具发现（Tool Registry）。向 Supervisor 暴露当前所有可用的 MCP 工具元数据。"""
+    try:
+        client = await get_or_create_mcp_client()
+        available_tools = await client.get_tools()
+
+        if not available_tools:
+            return "No internal enterprise tools currently available in the registry."
+
+        # 将工具列表格式化为说明书，返回给 Supervisor，生产环境中，若工具超过 20 个，可在此处引入轻量级 BM25 检索，仅返回 Top-K 相关的工具
+        catalog_info = "Available Enterprise Tools in Registry:\n"
+        for t in available_tools:
+            catalog_info += f"- Tool Name: `{t.name}`\n  Description: {t.description}\n\n"
+
+        catalog_info += "INSTRUCTION: Choose the most appropriate Tool Name(s) and assign them to the `required_tools` list when calling `ConductResearch`."
+        return catalog_info
+
+    except Exception as e:
+        return f"Error retrieving tools from registry: {str(e)}"
 
 ##########################
 # Skill工具组件
@@ -214,9 +281,9 @@ async def quantitative_analysis_skill(data_context: str, calculation_goal: str, 
 
     configurable = Configuration.from_runnable_config(config)
     skill_model = configurable_model.with_config({
-        "model": configurable.compression_model,  # 使用速度快、成本低的小模型写代码即可
+        "model": configurable.logical_reasoning_model,  # 使用速度快、成本低的小模型写代码即可
         "max_tokens": 1000,
-        "api_key": get_api_key_for_model(configurable.compression_model, config),
+        "api_key": get_api_key_for_model(configurable.logical_reasoning_model, config),
     })
 
     system_prompt = f"""You are a Python Data Analyst. Your job is to achieve the calculation goal based on the data.
@@ -271,28 +338,46 @@ async def quantitative_analysis_skill(data_context: str, calculation_goal: str, 
 async def long_doc_mining_skill(url: str, extraction_query: str, config: RunnableConfig = None) -> str:
     """
     长文/PDF 深度挖掘技能。
-    突破 15000 字符限制，使用内存级 BM25 检索目标块，交由小模型精准提纯。
+    突破 50000 字符限制，使用内存级 BM25 检索目标块，交由小模型精准提纯。
+    升级：支持原生 PDF 物理穿透
     """
     # 1. 全量获取文档 (无字符截断)
-    jina_url = f"https://r.jina.ai/{url}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "X-Timeout": "30"  # 延长超时时间以应对巨型 PDF
-    }
+    full_content = ""
 
-    # 自动携带 Jina Key（如果有配置）
-    jina_key = os.getenv("JINA_API_KEY")
-    if jina_key:
-        headers["Authorization"] = f"Bearer {jina_key}"
+    # 如果是 PDF 链接，直接下载并使用 PyPDFLoader 读取，绕过第三方解析的超时风险
+    if url.lower().endswith(".pdf") or "pdf" in url.lower():
+        print(f"\n[📄 PDF 穿透] 侦测到 PDF 链接，启动原生内存解析: {url}")
+        try:
+            # 使用同步 requests 下载文件，因为文件写入是同步操作
+            response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
 
-    try:
-        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-            response = await client.get(jina_url, headers=headers)
-            if response.status_code != 200:
-                return f"[❌ Skill Failed] Unable to fetch {url}. Status: {response.status_code}"
-            full_content = response.text
-    except Exception as e:
-        return f"[❌ Skill Failed] Network error fetching {url}: {str(e)}"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(response.content)
+                temp_pdf_path = temp_file.name
+
+            loader = PyPDFLoader(temp_pdf_path)
+            pages = loader.load()
+            full_content = "\n\n".join([p.page_content for p in pages])
+            os.remove(temp_pdf_path)  # 读完就删，不留垃圾
+        except Exception as e:
+            return f"[❌ Skill Failed] Native PDF extraction failed for {url}: {str(e)}"
+
+    else:
+        # 非 PDF 页面，依然走 Jina Reader
+        jina_url = f"https://r.jina.ai/{url}"
+        headers = {"User-Agent": "Mozilla/5.0", "X-Timeout": "30"}
+        jina_key = os.getenv("JINA_API_KEY")
+        if jina_key: headers["Authorization"] = f"Bearer {jina_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                response = await client.get(jina_url, headers=headers)
+                if response.status_code != 200:
+                    return f"[❌ Skill Failed] Unable to fetch {url}. Status: {response.status_code}"
+                full_content = response.text
+        except Exception as e:
+            return f"[❌ Skill Failed] Network error fetching {url}: {str(e)}"
 
     # 2. 内存级快速文本切片
     splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=300)
@@ -315,8 +400,8 @@ async def long_doc_mining_skill(url: str, extraction_query: str, config: Runnabl
 
     # 就地初始化模型，防止与 deep_researcher 产生循环引用
     skill_model = init_chat_model(
-        model=configurable.compression_model,
-        api_key=get_api_key_for_model(configurable.compression_model, config),
+        model=configurable.logical_reasoning_model,
+        api_key=get_api_key_for_model(configurable.logical_reasoning_model, config),
         max_tokens=1500
     )
 
@@ -361,7 +446,7 @@ async def data_visualization_skill(data_context: str, visualization_goal: str, c
 
     configurable = Configuration.from_runnable_config(config)
     skill_model = init_chat_model(
-        model=configurable.compression_model,
+        model=configurable.logical_reasoning_model,
         temperature=0.1,
         max_tokens=1500
     )
@@ -461,83 +546,6 @@ def get_active_skills(assigned_skill_names: List[str]) -> List[Any]:
 
     return active_skills
 
-##########################
-# 基础工具组件
-##########################
-
-async def get_search_tool(search_api: SearchAPI):
-    """根据指定的 API 提供商配置并返回搜索工具。
-
-    参数:
-        search_api: 搜索 API 提供商（Anthropic、OpenAI、Tavily 或 None）
-
-    返回:
-        指定提供商的已配置搜索工具对象列表
-    """
-    if search_api == SearchAPI.ANTHROPIC:
-        # 带使用次数限制的 Anthropic 原生网络搜索
-        return [{
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": 5
-        }]
-
-    elif search_api == SearchAPI.OPENAI:
-        # OpenAI 原生网络搜索预览功能
-        return [{"type": "web_search_preview"}]
-
-    elif search_api == SearchAPI.TAVILY:
-        # 配置带元数据的 Tavily 搜索工具
-        search_tool = web_search
-        search_tool.metadata = {
-            **(search_tool.metadata or {}),
-            "type": "search",
-            "name": "web_search"
-        }
-        return [search_tool]
-
-    elif search_api == SearchAPI.NONE:
-        # 未配置任何搜索功能
-        return []
-
-    # 未知搜索 API 类型的默认兜底处理
-    return []
-
-async def get_all_tools(config: RunnableConfig):
-    """组装完整工具包，包含研究、搜索和 MCP 工具。
-
-    参数:
-        config: 指定搜索 API 和 MCP 设置的运行时配置
-
-    返回:
-        用于研究操作的所有已配置且可用的工具列表
-    """
-    # 首先添加核心研究工具
-    tools = [tool(ResearchComplete), think_tool]
-
-    # 添加配置的搜索工具
-    configurable = Configuration.from_runnable_config(config)
-    search_api = SearchAPI(get_config_value(configurable.search_api))
-
-    # 若选择 Tavily，则挂载新改造的 web_search
-    if search_api == SearchAPI.TAVILY:
-        tools.append(web_search)
-        tools.append(fetch_webpage)
-    else:
-        search_tools = await get_search_tool(search_api)
-        tools.extend(search_tools)
-
-    # 记录已有工具名称以防冲突
-    existing_tool_names = {
-        tool.name if hasattr(tool, "name") else tool.get("name", "web_search")
-        for tool in tools
-    }
-
-    # # 若有配置则添加 MCP 工具
-    # mcp_tools = await load_mcp_tools(config, existing_tool_names)
-    # tools.extend(mcp_tools)
-
-    return tools
 
 ##########################
 # 模型供应商原生网络搜索组件

@@ -1,6 +1,6 @@
 """Deep Research 智能体的图状态定义与数据结构。"""
 import operator
-from typing import Annotated, Optional, List, Union, Any, Dict
+from typing import Annotated, Optional, List, Union, Any, Dict, Literal
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
@@ -37,10 +37,11 @@ class ConductResearch(BaseModel):
     research_topic: str = Field(
         description="待调研的具体子主题。必须是单一主题，且需包含高度详尽的描述（至少一段话）。",
     )
-    # 技能清单，带上备选工具的枚举说明
+    # 技能清单，移除写死的工具枚举，要求依赖 search_tools_catalog 的结果
     required_tools: List[str] = Field(
-        description="The specific tools this agent should have access to. Options: 'web_search', 'fetch_webpage', 'search_equipment_knowledge', 'query_erp_database'",
-        default=["web_search", "fetch_webpage"])
+        description="The specific tools this agent should have access to. For standard web search, use ['web_search', 'fetch_webpage']. For specialized tasks (e.g., RAG queries, DB queries, Git repos, internal docs), you MUST use the exact tool names returned by `search_tools_catalog`.",
+        default=["web_search", "fetch_webpage"]
+    )
     # 技能分配字段
     required_skills: List[str] = Field(
         description="分配给该研究员的专业技能。目前可用选项: 'quantitative_analysis', 'long_doc_mining', 'data_visualization'",
@@ -99,6 +100,12 @@ class SectionDraft(BaseModel):
     """并发子节点生成的章节草稿"""
     section_title: str = Field(description="章节标题")
     content: str = Field(description="章节内容")
+
+class TaskRouting(BaseModel):
+    """决定任务类型的路由模型"""
+    task_type: Literal["research", "direct_answer"] = Field(
+        description="如果是需要联网查资料的查询，返回'research'。如果是纯逻辑推理、数学计算、概率题等不需要联网即可解答的问题，返回'direct_answer'。"
+    )
 
 
 ###################

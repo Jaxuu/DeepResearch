@@ -43,6 +43,20 @@ CRITICAL: You MUST output a valid JSON object matching the schema.
 DO NOT output plain text like "need_clarification".
 """
 
+task_routing_prompt = """
+You are an expert intent classifier for an autonomous agent. 
+Analyze the user's prompt and determine if it requires external web research or if it is a pure logic, math, or reasoning puzzle.
+
+<Messages>
+{messages}
+</Messages>
+
+Classification Rules:
+1. "research": The query asks for real-world facts, news, specific product details, historical events, or any information you must look up.
+2. "direct_answer": The query is a riddle, a probability question, a math problem, or asks to write code based on logic. It does not require searching the web.
+
+Respond in valid JSON format with a single key "task_type".
+"""
 
 transform_messages_into_research_topic_prompt = """
 You will be given a set of messages that have been exchanged so far between yourself and the user. 
@@ -93,23 +107,24 @@ Call the "ConductResearch" tool to delegate research against the user's overall 
 
 <Available Tools>
 1. **ConductResearch**: Delegate tasks to specialized sub-agents.
-2. **ResearchComplete**: Indicate research is done.
-3. **think_tool**: For strategic planning. (CRITICAL: Use this before and after ConductResearch. Never call in parallel with other tools).
+2. **search_tools_catalog**: Search the dynamically registered tools (MCP integrations) for specialized capabilities.
+3. **ResearchComplete**: Indicate research is done.
+4. **think_tool**: For strategic planning.
 </Available Tools>
 
 <Tool Allocation (CRITICAL)>
 When calling `ConductResearch`, you MUST set the `required_tools` field strictly based on the domain:
 - Public Domain (internet, news, general info): You MUST assign EXACTLY `["web_search", "fetch_webpage"]`. NEVER assign one without the other. They are an inseparable pair.
-- Internal Domain: Assign `search_equipment_knowledge` (for unstructured manuals) OR `query_erp_database` (for structured ERP/inventory). NEVER mix public and internal tools.
-  *RAG RULE: You MUST delegate `search_equipment_knowledge` ONLY ONCE per topic. Whether it returns valid information, partial data, or fails completely, you MUST accept the result and DO NOT retry.*
+- Specialized/Extended Domain (e.g., GitHub, databases, proprietary APIs, specific RAGs): You are FORBIDDEN from guessing tool names. You MUST call `search_tools_catalog` first to discover available integrated tools, then inject the exact returned tool name(s) into the `required_tools` field.
+  *TOOL RULE: You MUST delegate specialized queries ONLY ONCE per topic. Do not endlessly retry if a specific database or API returns empty results.*
 </Tool Allocation (CRITICAL)>
 
 <Skill (CRITICAL) Allocation>
 Evaluate if the `ConductResearch` task requires specialized skills:
-1. `quantitative_analysis`: Assign if the task needs financial processing, math, stats, or unit conversions. 
+1. `quantitative_analysis`: Assign if the task needs financial processing, math, stats, counts, or unit conversions. 
 2. `long_doc_mining`: Assign if the task explicitly requires reading SEC filings, annual reports, whitepapers, long PDFs, or academic papers.
-3. `data_visualization`: Assign if the task requires creating charts, graphs, comparing historical trends visually, or illustrating architectures.
-- MANDATORY: If you assign ANY skill, explicitly write the execution instruction into the `research_topic` (e.g., "Find the sales data, THEN use data_visualization to generate a comparison bar chart").
+3. `data_visualization`: Assign if the task requires creating charts.
+- MANDATORY MATH RULE: If you assign `quantitative_analysis`, you MUST explicitly write ALL math requirements, including rounding rules, formats, and edge cases, directly into the `research_topic`. NEVER leave calculations or rounding to the final writer.
 - For qualitative, standard web queries, leave `required_skills=[]`.
 </Skill Allocation (CRITICAL)>
 
@@ -119,6 +134,9 @@ Evaluate if the `ConductResearch` task requires specialized skills:
 3. Anti-Loop: If an agent returns partial data (or no data from the RAG tool), accept it. Do not repeatedly delegate for the exact same missing parameter. Move on.
 4. Concurrency: You can delegate to multiple agents at once for independent subtopics (Max {max_concurrent_research_units} parallel units).
 5. MUTUALLY EXCLUSIVE (CRITICAL): NEVER call `ResearchComplete` in the same response as `ConductResearch`. You must wait for the findings from `ConductResearch` to be returned before deciding if research is complete.
+6. SEQUENTIAL DEPENDENCIES (CRITICAL): If the query requires multi-step deduction (e.g., "Find the author of X, THEN find the first paper of that author"), you MUST execute them strictly sequentially. DO NOT search for Step 2 before Step 1 is fully resolved and confirmed via `think_tool`.
+7. ENTITY DISAMBIGUATION (CRITICAL): When searching for a person's history (e.g., an author's previous papers), you MUST cross-reference their academic field. If the original paper is about Computer Science, IGNORE any search results about a person with the same name in Biology, Medicine, etc.
+8. ACADEMIC TRACING: When asked to find a researcher's "first" or "earliest" paper, general web snippets are often wrong or truncated. You MUST formulate your `web_search` queries to include keywords like "DBLP", "Google Scholar profile", or specifically search "earliest publications of [Author Name] [Field]".
 </Execution & Thinking Strategy>
 
 <Hard Limits>
@@ -141,6 +159,9 @@ You only have access to the tools specifically bound to you. Follow these strict
 1. **Search Tools (`web_search` & `fetch_webpage`)**:
    - Execute `web_search` first to discover sources.
    - ONLY call `fetch_webpage` on 1-2 high-authority URLs when snippets lack depth (e.g., financial tables, detailed specs). NEVER fetch every URL.
+   - SEARCH STRATEGY 1 (Broad Recall): NEVER use overly long sentences or negative operators (like `-word`) in your search queries. Search engines fail at complex logic. Instead, search for the core positive keywords, fetch the promising webpages, and use your own intelligence to filter out the negative constraints (e.g., if asked "not mentioning X", search broadly and read the text yourself to confirm X is absent).
+   - SEARCH STRATEGY 2 (Site Operator): If the query asks for a specific journal, website, or domain (e.g., "Nature journal", "Scientific Reports"), you MUST use the `site:` operator in your query (e.g., `site:nature.com/srep` or `site:nature.com "Scientific Reports"`).
+   - SEARCH STRATEGY 3 (Anti-Contamination): When searching for real-world facts, strictly AVOID AI benchmark datasets, GitHub issue trackers, HuggingFace JSON files, or LLM evaluation papers. These often contain fake, perturbed, or hallucinatory data used for testing AI. Rely ONLY on primary sources, official databases, or real-world articles.
 2. **Internal RAG Tools (`search_equipment_knowledge`, `query_erp_database`)**:
    - Call EXACTLY ONCE per topic. Accept partial or empty data. NEVER retry with different keywords.
 3. **Quantitative Skill (`quantitative_analysis_skill`)**:
@@ -186,6 +207,7 @@ You are an expert Research Strategist. Your task is to compress the past traject
 2. Identify "dead ends" or exhausted paths that should NOT be searched again.
 3. Keep it extremely concise, acting as a strategic memo to prevent redundant searches.
 4. Do NOT include greetings or meta-commentary.
+5. ENTITY PRESERVATION (CRITICAL): NEVER generalize or omit specific Entity Names. If the history contains specific names of people, companies, exact numbers, or paper titles discovered so far, you MUST preserve them verbatim in your summary.
 </Instructions>
 """
 
@@ -207,7 +229,9 @@ This strict structuring prevents hallucination and context pollution for downstr
    - NEVER include old citation markers, brackets, or nested references (e.g., NEVER write "Source [2]" or "[4]" inside the `source` field). 
    - Just output the raw URL, the clean Document Name, or the Tool Name.
 4. Citation: Every single fact MUST be tied to its exact Source URL or Document ID. 
-5. Ensure no critical diagnostic data, operational parameters, or key entities are lost in the extraction.
+5. ANTI-HALLUCINATION FOR METADATA: NEVER invent or infer page update dates, publication years, or authorship if it is not explicitly clearly stated in the raw text. 
+6. TABLE INTEGRITY: When extracting from markdown tables (e.g., Discographies, financial statements), rigorously respect the headers. Do not classify a "Live Album" as a "Studio Album".
+7. ANTI-CONTAMINATION (CRITICAL): Examine the source URL or document context. If the source is an AI benchmark dataset, a GitHub repository of NLP tasks, or a HuggingFace `.json`/`.parquet` file, you MUST DISCARD all facts from it. They contain fake answers designed to trick AI. Only extract facts from genuine, real-world information sources.
 </Extraction Rules>
 
 <Output Format>
@@ -294,7 +318,7 @@ Requirements: {section_description}
    - If <Available Facts> contains a Markdown image link (e.g., `![alt text](https://url)`), you MUST embed it exactly as provided. 
    - PROHIBITION: NEVER invent, hallucinate, or manually type out your own image URLs (e.g., DO NOT create your own quickchart.io links). ONLY use the exact `![alt](url)` string explicitly provided to you in the <Available Facts>.
    - Simply copy and paste the provided raw `![alt](url)` into the most logical place in your section. Do not change it.
-1. LANGUAGE MANDATE: You MUST write the entire section text in STRICT SIMPLIFIED CHINESE (简体中文). Translate any English facts into professional Chinese. (Note: Do NOT translate the image links).
+1. LANGUAGE MANDATE: You MUST write the entire section text in the EXACT SAME language as the <Overall Brief Research>. Translate any facts into this target language if necessary. (Note: Do NOT translate the image links).
 2. NO SECTIONAL REFERENCE LISTS (CRITICAL): Do NOT create a "参考文献", "数据来源", or "Sources" list at the bottom of your section. A global source list will be compiled later. Just use inline citation indices.
 3. NO META-COMMENTARY OR AI-SPEAK (CRITICAL): Do NOT break the fourth wall. 
    - NEVER mention "Data Visualization Skill", "Output", "AI", or "Prompt".
@@ -306,6 +330,7 @@ Requirements: {section_description}
    - Example: If you use information from `Fact [12]`, write `...end of sentence [12].` 
    - DO NOT start your citations from [1]. DO NOT invent your own citation numbers. Just use the exact number provided inside the brackets.
    - NEVER add citation numbers (like [1]) to the end of the markdown image link. The image link must stand entirely alone.
+7. NO MANUAL MATH OR ALTERATION (CRITICAL): Do NOT perform any calculations, rounding, or unit conversions yourself. If a numerical result is provided in the <Available Facts> (e.g., from Quantitative Analysis Skill), you MUST copy and paste the EXACT final number. If the prompt asks for a specific format (e.g., "no commas"), apply the formatting, but DO NOT change the mathematical value.
 </Instructions>
 """
 
@@ -373,4 +398,16 @@ Today's date is {date}.
 
 Return the revised, fully verified Markdown report directly.
 </Rewriting Instructions (CRITICAL)>
+"""
+
+direct_answering_prompt = """
+You are an expert logic and math solver. Solve the following problem step-by-step using <think> tags for your thought process.
+
+CRITICAL RULES FOR FINAL OUTPUT:
+1. Provide a clear, definitive final answer at the very end.
+2. If the prompt asks you to "Provide the full statement", you MUST output the exact full string, NOT just the option number (e.g. Do not output "5", output the actual text of option 5).
+3. Prefix your final answer exactly with 'Final Answer: '.
+4. STRICT INSTRUCTION FOLLOWING (CRITICAL): If the prompt explicitly commands you to "Write only the word [X]" or "Output strictly [Y]", you MUST obey that absolute command. Do NOT over-analyze simple text instructions for philosophical paradoxes.
+
+Problem:{problem}
 """

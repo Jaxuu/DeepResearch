@@ -33,7 +33,9 @@ from open_deep_research.prompts import (
     rewrite_report_prompt,
     generate_outline_prompt,
     write_section_prompt,
-    memory_folding_prompt
+    memory_folding_prompt,
+    task_routing_prompt,
+    direct_answering_prompt,
 )
 from open_deep_research.state import (
     AgentInputState,
@@ -51,7 +53,8 @@ from open_deep_research.state import (
     SectionOutline,
     ReportOutline,
     SectionDraft,
-    WriteSectionState
+    WriteSectionState,
+    TaskRouting,
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
@@ -66,7 +69,8 @@ from open_deep_research.utils import (
     quantitative_analysis_skill,
     long_doc_mining_skill,
     data_visualization_skill,
-    get_active_skills
+    get_active_skills,
+    search_tools_catalog
 )
 
 # 初始化一个可配置的模型，将在整个智能体中使用
@@ -74,7 +78,7 @@ configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key", "model_kwargs"),
 )
 
-async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
+async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["route_task", "__end__"]]:
     """分析用户消息，如果研究范围不清晰则提出澄清问题。
 
     此函数判断用户的请求在继续研究之前是否需要澄清。
@@ -91,7 +95,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     configurable = Configuration.from_runnable_config(config)
     if not configurable.allow_clarification:
         # 跳过澄清步骤，直接进入研究简报生成
-        return Command(goto="write_research_brief")
+        return Command(goto="route_task")
 
     # 第2步：准备模型进行结构化澄清分析
     messages = state["messages"]
@@ -127,10 +131,53 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     else:
         # 继续进入研究阶段，并附带确认消息
         return Command(
-            goto="write_research_brief",
+            goto="route_task",
             update={"messages": [AIMessage(content=response.verification)]}
         )
 
+
+async def route_task(state: AgentState, config: RunnableConfig) -> Command[
+    Literal["write_research_brief", "direct_answering"]]:
+    """智能路由节点：判断是走检索流水线，还是直接走逻辑推理。"""
+    configurable = Configuration.from_runnable_config(config)
+    model = configurable_model.with_structured_output(TaskRouting, method="json_mode").with_config({
+        "model": configurable.supervisor_model,
+        "max_tokens": configurable.supervisor_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.supervisor_model, config),
+        "tags": ["langsmith:nostream"]
+    })
+
+    prompt = task_routing_prompt.format(messages=get_buffer_string(state.get("messages", [])))
+    decision = await model.ainvoke([HumanMessage(content=prompt)])
+
+    if decision.task_type == "direct_answer":
+        print("\n[🔀 智能路由] 识别为逻辑/计算题，启动思维链短路推理，跳过检索流程。")
+        return Command(goto="direct_answering")
+    else:
+        print("\n[🔀 智能路由] 识别为调研任务，进入多智能体深度检索流水线。")
+        return Command(goto="write_research_brief")
+
+
+async def direct_answering(state: AgentState, config: RunnableConfig) -> Command[Literal["__end__"]]:
+    """短路推理节点：用于回答纯逻辑和数学题。"""
+    configurable = Configuration.from_runnable_config(config)
+    model = configurable_model.with_config({
+        "model": configurable.logical_reasoning_model,
+        "max_tokens": configurable.logical_reasoning_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.logical_reasoning_model, config),
+    })
+
+    prompt = direct_answering_prompt.format(problem=get_buffer_string(state.get("messages", [])))
+
+    response = await model.ainvoke([HumanMessage(content=prompt)])
+
+    return Command(
+        goto=END,
+        update={
+            "final_report": response.content,
+            "messages": [response]
+        }
+    )
 
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
     """将用户消息转换为结构化的研究概要，并初始化主管智能体。
@@ -215,7 +262,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     }
 
     # 可用工具：研究委派、完成信号、战略思考
-    lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool]
+    lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool, search_tools_catalog]
 
     # 配置模型：绑定工具 + 重试逻辑 + 模型设置
     research_model = (
@@ -298,6 +345,20 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             content=f"Reflections recorded: {tool_call['args'].get('reflection', '')}",
             name=tool_call["name"],
             tool_call_id=tool_call["id"]
+        ))
+
+    # 处理 search_tools_catalog 调用
+    catalog_tool_calls = [
+        tc for tc in most_recent_message.tool_calls
+        if tc["name"] == "search_tools_catalog"
+    ]
+    for tc in catalog_tool_calls:
+        # 直接调用工具并返回观察结果
+        observation = await search_tools_catalog.ainvoke(tc["args"], config)
+        update_payload["supervisor_messages"].append(ToolMessage(
+            content=observation,
+            name=tc["name"],
+            tool_call_id=tc["id"]
         ))
 
     # 处理 ConductResearch 调用（研究委派）
@@ -445,6 +506,12 @@ async def human_review(state: AgentState, config: RunnableConfig) -> Command[
     Literal["research_supervisor", "generate_outline"]]:
     """人在回路 (HITL) 节点：挂起工作流，等待人类审核事实或追加干预指令。"""
 
+    # ===== 自动化测试旁路开关 =====
+    if config.get("configurable", {}).get("simulate_human_approval", False):
+        print("\n[🤖 自动化测试] 检测到测试环境，跳过人类审查，直接放行进入大纲生成阶段。")
+        return Command(goto="generate_outline")
+    # ====================================
+
     facts = state.get("structured_facts", [])
 
     # 兼容 Pydantic v2 (model_dump) 和 v1 (dict)
@@ -526,11 +593,16 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     allowed_tool_names = state.get("required_tools", ["web_search", "fetch_webpage"])
     active_tools = []
 
+    tool_names = []
     for tool in tools:
         tool_name = tool.name if hasattr(tool, "name") else tool.get("name", "web_search")
         # 永远保留思考节点，并挂载 Supervisor 准许的业务工具
         if tool_name == "think_tool" or tool_name in allowed_tool_names:
+            tool_names.append(tool_name)
             active_tools.append(tool)
+
+    # if tool_names:
+        # print(f"\n[🔧 工具挂载] 激活专属工具: {tool_names}")
 
     # 精准挂载分配的技能
     assigned_skills = state.get("required_skills", [])
@@ -539,10 +611,10 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     if loaded_skills:
         active_tools.extend(loaded_skills)
         loaded_skill_names = [s.name for s in loaded_skills]
-        print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
+        # print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
 
     active_tool_names = [t.name if hasattr(t, "name") else t.get("name") for t in active_tools]
-    print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
+    # print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
 
     # 第2步：配置研究员模型及工具
     research_model_config = {
@@ -620,6 +692,13 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
 
     # 第2步：处理工具调用（搜索、MCP 工具、skills等）
     tools = await get_all_tools(config)
+    from open_deep_research.utils import _mcp_client
+    if _mcp_client is not None:
+        try:
+            mcp_tools = await _mcp_client.get_tools()
+            tools.extend(mcp_tools)
+        except Exception:
+            pass
     # 动态合并分配到的所有技能
     assigned_skills = state.get("required_skills", [])
     tools.extend(get_active_skills(assigned_skills))
@@ -833,8 +912,8 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
     )
 
     outline_model = configurable_model.with_structured_output(ReportOutline,method="json_mode").with_config({
-        "model": configurable.final_report_model,
-        "api_key": get_api_key_for_model(configurable.final_report_model, config),
+        "model": configurable.research_model,
+        "api_key": get_api_key_for_model(configurable.research_model, config),
         "tags": ["langsmith:nostream"]
     })
 
@@ -931,9 +1010,9 @@ async def write_section(state: WriteSectionState, config: RunnableConfig):
     )
 
     writer_model = configurable_model.with_config({
-        "model": configurable.final_report_model,
+        "model": configurable.writer_model,
         "max_tokens": 4000,
-        "api_key": get_api_key_for_model(configurable.final_report_model, config)
+        "api_key": get_api_key_for_model(configurable.writer_model, config)
     })
 
     section_content = await writer_model.ainvoke([HumanMessage(content=prompt)])
@@ -1049,9 +1128,9 @@ async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[L
     )
 
     writer_model_config = {
-        "model": configurable.final_report_model,
-        "max_tokens": configurable.final_report_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.final_report_model, config),
+        "model": configurable.writer_model,
+        "max_tokens": configurable.writer_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.writer_model, config),
         "tags": ["langsmith:nostream"]
     }
 
@@ -1094,6 +1173,8 @@ deep_researcher_builder = StateGraph(
 
 # 添加主工作流节点：完整研究过程
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)           # 用户澄清阶段
+deep_researcher_builder.add_node("route_task", route_task)                         # 任务路由节点
+deep_researcher_builder.add_node("direct_answering", direct_answering)             # 直接回答节点
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # 研究规划阶段
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # 研究执行阶段
 deep_researcher_builder.add_node("human_review", human_review)                     # HITL审核节点

@@ -192,17 +192,17 @@ class Configuration(BaseModel):
             }
         }
     )
-    final_report_model: str = Field(
-        default=os.getenv("FINAL_REPORT_MODEL"),
+    writer_model: str = Field(
+        default=os.getenv("WRITER_MODEL"),
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": os.getenv("FINAL_REPORT_MODEL"),
+                "default": os.getenv("WRITER_MODEL"),
                 "description": "Model for writing the final report from all research findings"
             }
         }
     )
-    final_report_model_max_tokens: int = Field(
+    writer_model_max_tokens: int = Field(
         default=8192,
         metadata={
             "x_oap_ui_config": {
@@ -229,6 +229,26 @@ class Configuration(BaseModel):
                 "type": "number",
                 "default": 4000,
                 "description": "Maximum output tokens for verifier model"
+            }
+        }
+    )
+    logical_reasoning_model: str = Field(
+        default=os.getenv("LOGICAL_REASONING_MODEL"),
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": os.getenv("LOGICAL_REASONING_MODEL"),
+                "description": "Model for logical reasoning of the generated report"
+            }
+        }
+    )
+    logical_reasoning_model_max_tokens: int = Field(
+        default=10000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 10000,
+                "description": "Maximum output tokens for logical reasoning model"
             }
         }
     )
