@@ -235,27 +235,6 @@ async def get_or_create_mcp_client():
         _mcp_client = MultiServerMCPClient(mcp_config)
     return _mcp_client
 
-@tool(description="Search the dynamic Tool Registry for extended workspace tools and third-party integrations (e.g., Databases, GitHub, RAG, Slack). Pass a natural language query describing the capabilities you need.")
-async def search_tools_catalog(query: str, config: RunnableConfig = None) -> str:
-    """动态工具发现（Tool Registry）。向 Supervisor 暴露当前所有可用的 MCP 工具元数据。"""
-    try:
-        client = await get_or_create_mcp_client()
-        available_tools = await client.get_tools()
-
-        if not available_tools:
-            return "No internal enterprise tools currently available in the registry."
-
-        # 将工具列表格式化为说明书，返回给 Supervisor，生产环境中，若工具超过 20 个，可在此处引入轻量级 BM25 检索，仅返回 Top-K 相关的工具
-        catalog_info = "Available Enterprise Tools in Registry:\n"
-        for t in available_tools:
-            catalog_info += f"- Tool Name: `{t.name}`\n  Description: {t.description}\n\n"
-
-        catalog_info += "INSTRUCTION: Choose the most appropriate Tool Name(s) and assign them to the `required_tools` list when calling `ConductResearch`."
-        return catalog_info
-
-    except Exception as e:
-        return f"Error retrieving tools from registry: {str(e)}"
-
 ##########################
 # Skill工具组件
 ##########################
@@ -264,7 +243,9 @@ async def search_tools_catalog(query: str, config: RunnableConfig = None) -> str
 _python_repl = PythonREPL()
 
 @tool(
-    description="A highly capable quantitative analysis skill. Pass in raw data (like financial tables or stats) and a specific calculation goal. It will autonomously write, execute, and debug code to find the answer."
+    description="""A highly capable quantitative analysis skill. 
+    TRIGGER: Use this ANYTIME financial processing, math, stats, counts, or unit conversions are required.
+    RULE: DO NOT perform manual calculations or rounding yourself. You MUST explicitly write ALL math requirements into the 'calculation_goal' and pass the raw data as 'data_context' to get the execution result."""
 )
 async def quantitative_analysis_skill(data_context: str, calculation_goal: str, config: RunnableConfig = None) -> str:
     """
@@ -331,9 +312,9 @@ async def quantitative_analysis_skill(data_context: str, calculation_goal: str, 
 
 
 @tool(
-    description="""A Sub-RAG skill for deep mining of EXTREMELY LONG documents (e.g., annual reports, SEC filings, PDFs, long academic papers). 
-    Use this when 'fetch_webpage' is not enough due to length limits. 
-    Pass the specific 'url' and a highly detailed 'extraction_query'. It will read the entire document in the background and extract the exact answer."""
+    description="""A Sub-RAG skill for deep mining of EXTREMELY LONG documents.
+    TRIGGER: Use this ANYTIME the source is an extremely long document (e.g., annual reports, SEC filings, PDFs, academic papers) where 'fetch_webpage' is insufficient.
+    RULE: Pass the specific 'url' and a highly detailed 'extraction_query'. It will read the entire document in the background and extract the exact answer."""
 )
 async def long_doc_mining_skill(url: str, extraction_query: str, config: RunnableConfig = None) -> str:
     """
@@ -431,11 +412,11 @@ async def long_doc_mining_skill(url: str, extraction_query: str, config: Runnabl
     except Exception as e:
         return f"[❌ Skill Failed] LLM extraction error: {str(e)}"
 
-
 @tool(
-    description="""A specialized Data Visualization skill. 
-    Use this when you need to create charts, graphs, or diagrams (e.g., comparing revenue, visualizing market share, showing timelines).
-    Pass the raw numerical data or relationships as 'data_context', and state exactly what kind of chart you want in 'visualization_goal'."""
+    description="""A specialized Data Visualization skill.
+    TRIGGER: Use this ANYTIME you need to create charts, graphs, or visual data representations (e.g., comparing revenue, market share).
+    RULE: Freehand drawing is strictly forbidden. 
+    INPUT: Pass raw numerical data as 'data_context' and a very simple chart design goal as 'visualization_goal'."""
 )
 async def data_visualization_skill(data_context: str, visualization_goal: str, config: RunnableConfig = None) -> str:
     """
@@ -546,6 +527,37 @@ def get_active_skills(assigned_skill_names: List[str]) -> List[Any]:
 
     return active_skills
 
+##########################
+# 动态感知工具和技能组件
+##########################
+
+@tool(
+    description="Search the Unified Tool Registry for both native system skills and external MCP integrations. Use this when you need specialized processing (e.g., charts, complex math, long documents, databases). Pass a natural language query describing the capability you need.")
+async def search_tools_catalog(query: str, config: RunnableConfig = None) -> str:
+    """动态工具与技能发现。向 Supervisor 统一暴露原生技能与 MCP 集成。"""
+    catalog_info = "Available Capabilities in Registry:\n\n"
+
+    # 1. 挂载原生系统技能 (Native Skills)
+    catalog_info += "--- [System Native Skills] ---\n"
+    # AVAILABLE_SKILLS 是 utils.py 中已经存在的字典
+    for skill_name, skill_func in AVAILABLE_SKILLS.items():
+        catalog_info += f"- Skill Name: `{skill_name}`\n  Description: {skill_func.description}\n\n"
+
+    # 2. 挂载外部扩展工具 (MCP Integrations)
+    catalog_info += "--- [External MCP Integrations] ---\n"
+    try:
+        client = await get_or_create_mcp_client()
+        available_tools = await client.get_tools()
+        if available_tools:
+            for t in available_tools:
+                catalog_info += f"- Tool Name: `{t.name}`\n  Description: {t.description}\n\n"
+        else:
+            catalog_info += "(No MCP integrations currently active)\n\n"
+    except Exception as e:
+        catalog_info += f"(Failed to load MCP integrations: {str(e)})\n\n"
+
+    catalog_info += "INSTRUCTION: Assign native skills to `required_skills` and MCP tools to `required_tools` in `ConductResearch` based on these exact names."
+    return catalog_info
 
 ##########################
 # 模型供应商原生网络搜索组件
@@ -890,7 +902,9 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
         api_keys = config.get("configurable", {}).get("apiKeys", {})
         if not api_keys:
             return None
-        if model_name.startswith("openai:"):
+        if model_name.startswith("openai:deepseek"):
+            return api_keys.get("DEEPSEEK_API_KEY")
+        elif model_name.startswith("openai:"):
             return api_keys.get("OPENAI_API_KEY")
         elif model_name.startswith("qwen"):
             return api_keys.get("DASHSCOPE_API_KEY")
@@ -900,7 +914,9 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("GOOGLE_API_KEY")
         return None
     else:
-        if model_name.startswith("openai:"):
+        if model_name.startswith("openai:deepseek"):
+            return os.getenv("DEEPSEEK_API_KEY")
+        elif model_name.startswith("openai:"):
             return os.getenv("OPENAI_API_KEY")
         elif model_name.startswith("qwen"):
             return os.getenv("DASHSCOPE_API_KEY")

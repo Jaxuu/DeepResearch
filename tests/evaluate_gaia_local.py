@@ -9,10 +9,18 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # 初始化一个廉价小模型作为提取器，消耗 Token 极少
+# extractor_model = init_chat_model(
+#     model="gemini-3.6-flash",
+#     model_provider="google_genai",  # <--- 强制指定为 Google AI Studio 接口,明确指定走 google_genai 协议，即 Google AI Studio 个人 API
+#     api_key=os.getenv("GOOGLE_API_KEY"), # 请确保此处与你 .env 中的变量名一致
+#     temperature=0
+# )
+
 extractor_model = init_chat_model(
-    model="gemini-3.6-flash",
-    model_provider="google_genai",  # <--- 强制指定为 Google AI Studio 接口,明确指定走 google_genai 协议，即 Google AI Studio 个人 API
-    api_key=os.getenv("GOOGLE_API_KEY"), # 请确保此处与你 .env 中的变量名一致
+    model="qwen-turbo",
+    model_provider="openai",
+    max_tokens=1024,
+    api_key=os.getenv("OPENAI_API_KEY"), # 请确保此处与你 .env 中的变量名一致
     temperature=0
 )
 
@@ -56,7 +64,7 @@ async def main():
     with open(dataset_path, "r", encoding="utf-8") as f:
         original_dataset = json.load(f)
 
-    dataset = original_dataset[:5]
+    dataset = original_dataset[:19]
     correct_count = 0
     total_tests = len(dataset)
 

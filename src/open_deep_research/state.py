@@ -44,8 +44,9 @@ class ConductResearch(BaseModel):
     )
     # 技能分配字段
     required_skills: List[str] = Field(
-        description="分配给该研究员的专业技能。目前可用选项: 'quantitative_analysis', 'long_doc_mining', 'data_visualization'",
-        default=[])
+        description="The specific native skills assigned to this agent. You MUST NOT guess skill names. You MUST query `search_tools_catalog` to discover available skills and use the exact names returned.",
+        default=[]
+    )
 
 class ResearchComplete(BaseModel):
     """调用此工具表示所有调研工作已完成。"""
