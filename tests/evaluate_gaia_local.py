@@ -40,6 +40,7 @@ async def extract_final_answer(question: str, report: str) -> str:
         4. Do NOT output conversational fillers like "The answer is" or "Based on the report".
         5. If the report does not contain the answer, output 'NOT_FOUND'.
         6. LANGUAGE ALIGNMENT: You MUST output the final answer in the exact same language as the original Question. If the report is in another language, translate the specific entity back to the Question's language before outputting it.
+        7. AVOID DISTRACTIONS: The report may contain multiple entities. Look closely at the exact phrasing of the Question to select the one that fits perfectly. Do not be distracted by other entities mentioned in the report's background context.
         """
     response = await extractor_model.ainvoke([HumanMessage(content=prompt)])
     # 兼容处理 LangChain 的 List 类型内容块
@@ -59,12 +60,12 @@ async def extract_final_answer(question: str, report: str) -> str:
 
 
 async def main():
-    # 读取本地的自定义测试集
-    dataset_path = os.path.join(os.path.dirname(__file__), "custom_dataset.json")
+    # 读取本地的自定义测试集-
+    dataset_path = os.path.join("../datasets/custom_dataset.json")
     with open(dataset_path, "r", encoding="utf-8") as f:
         original_dataset = json.load(f)
 
-    dataset = original_dataset[:19]
+    dataset = original_dataset[:5]
     correct_count = 0
     total_tests = len(dataset)
 

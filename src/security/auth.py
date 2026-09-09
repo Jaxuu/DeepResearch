@@ -1,3 +1,45 @@
+"""
+LangGraph 安全网关与多租户数据隔离模块 (Security Gateway & Multi-Tenant Isolation)
+
+本模块作为 LangGraph API Server 的底层全局拦截器，深度集成 Supabase Auth 系统，
+实现了生产级别的零信任鉴权（Zero-Trust Authentication）和行级数据物理隔离。
+无论用户在前端通过何种方式登录（包含未开启邮箱验证的快捷注册），本模块都将基于颁发的
+JWT Token 实施严格的访问控制。
+
+核心工作流与逻辑抽象：
+
+1. 【身份核验 (Authentication)】 -> `@auth.authenticate`
+   - 拦截所有进入 LangGraph 的网络请求，解析 Authorization Header[cite: 12]。
+   - 通过 `supabase.auth.get_user` 实时向认证服务器发起校验，防止 Token 伪造或过期[cite: 12]。
+   - 验证通过后，将 Supabase 返回的用户 UUID 提取并注入到全局上下文 `ctx.user.identity` 中[cite: 12]。
+   - 特例：放行 LangGraph Studio 的本地调试用户 (`StudioUser`)，以及携带 `local-dev-token-123` 的本地测试请求[cite: 12]。
+
+2. 【资产打标 (Write Isolation)】 -> `@auth.onthreads.create`
+   - 作用域：Threads (会话)[cite: 12]、Assistants (智能体)[cite: 12]。
+   - 在数据正式落盘写入数据库之前触发拦截。
+   - 无视前端传入的参数，服务端强制在 `metadata` 字典中盖上当前用户的私有钢印 (`metadata["owner"] = ctx.user.identity`)[cite: 12]。
+   - 确保同一数据库中的每一条记录都在物理层面永久绑定其创建者。
+
+3. 【视线屏蔽 (Read Isolation)】 -> `@auth.on.threads.read/search/update/delete`
+   - 作用域：Threads (会话)[cite: 12]、Assistants (智能体)[cite: 12]。
+   - 在执行数据库查询或修改操作之前触发拦截。
+   - 自动向底层的 SQL 查询中强制追加过滤条件 `{"owner": ctx.user.identity}`[cite: 12]。
+   - 确保用户即使发起无条件的全局 `search`，也绝对只能拉取到属于自己的私有数据[cite: 12]，实现“单库多租户”的数据防串透。
+
+4. 【智能体配置隔离 (Assistant Isolation)】 ->  auth.on.assistants...
+   - LangGraph 支持基于核心代码保存不同的“个性化配置实例”（即 Assistants，例如绑定了不同模型或特定参数的实例）。
+   - `@auth.on.assistants.create`: 当用户保存自定义 Assistant 配置时，强制绑定其所有权 (`metadata["owner"] = ctx.user.identity`)[cite: 12]。
+   - `@auth.on.assistants.read/search`: 检索 Assistant 列表时，确保用户只能查看到系统默认的以及自己私有创建的配置实例[cite: 12]。
+   - `@auth.on.assistants.update/delete`: 保护机制，防止用户越权修改或删除其他租户的专属 Assistant 模板[cite: 12]。
+
+5. 【长期记忆隔离 (Store Isolation)】 -> `@auth.on.store`
+   - 拦截对 LangGraph 跨会话长期记忆库 (Store) 的访问请求。
+   - 强制校验请求的存储路径（Namespace 的首层目录）必须与当前用户的 UUID 一致 (`namespace[0] == ctx.user.identity`)[cite: 12]，否则拒绝访问[cite: 12]。
+
+依赖前提：
+- 环境变量 `SUPABASE_URL` 和 `SUPABASE_KEY` 必须正确配置并能够连接到 Supabase 实例[cite: 12]。
+"""
+
 import os
 import asyncio
 from langgraph_sdk import Auth

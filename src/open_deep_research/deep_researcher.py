@@ -264,10 +264,14 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     # 可用工具：研究委派、完成信号、战略思考
     lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool, search_tools_catalog]
 
+    # 如果是第一轮，死死锁住只能用 think_tool 思考；后续轮次强制要求必须调用任意工具（"any"）
+    current_iteration = state.get("research_iterations", 0)
+    enforced_tool_choice = "think_tool" if current_iteration == 0 else "any"
+
     # 配置模型：绑定工具 + 重试逻辑 + 模型设置
     research_model = (
         configurable_model
-        .bind_tools(lead_researcher_tools)
+        .bind_tools(lead_researcher_tools, tool_choice=enforced_tool_choice)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(research_model_config)
     )
@@ -290,8 +294,9 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
 
     此函数处理三种类型的主管工具调用：
     1. think_tool - 战略反思，继续对话
-    2. ConductResearch - 将研究任务委派给子研究员
-    3. ResearchComplete - 标记研究阶段完成
+    2. search_tools_catalog - 在统一工具注册表中搜索本地系统技能和外部MCP集成。
+    3. ConductResearch - 将研究任务委派给子研究员
+    4. ResearchComplete - 标记研究阶段完成
 
     Args:
         state: 当前主管状态，包含消息和迭代计数
@@ -322,12 +327,16 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     )
     should_end_research = research_complete_called and not conduct_research_calls
 
-    # 如果满足任一终止条件则退出
-    if exceeded_allowed_iterations or no_tool_calls or should_end_research:
-        return Command(
-            goto=END,
-            update={"structured_facts": state.get("structured_facts", [])}
-        )
+    # 如果迭代超限 或 主动调用了完成，则正常退出
+    if exceeded_allowed_iterations or should_end_research:
+        return Command(goto=END, update={"structured_facts": state.get("structured_facts", [])})
+
+    # 如果模型忘记调工具，强制打回，而不是结束！
+    if no_tool_calls:
+        print("\n[拦截] Supervisor 未调用工具，强制打回要求调用工具。")
+        warning_msg = HumanMessage(
+            content="[SYSTEM ERROR] You MUST execute a tool call. Do not just output conversational text. Please call `think_tool`")
+        return Command(goto="supervisor", update={"supervisor_messages": [warning_msg]})
 
     # 第2步：同时处理所有工具调用（包括 think_tool 和 ConductResearch）
     update_payload = {"supervisor_messages": []}
@@ -340,7 +349,6 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     ]
 
     for tool_call in think_tool_calls:
-        reflection_content = tool_call["args"]["reflection"]
         update_payload["supervisor_messages"].append(ToolMessage(
             content=f"Reflections recorded: {tool_call['args'].get('reflection', '')}",
             name=tool_call["name"],
@@ -590,19 +598,19 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         )
 
     # 精准挂载分配的工具
-    allowed_tool_names = state.get("required_tools", ["web_search", "fetch_webpage"])
+    allowed_tool_names = state.get("required_tools", ["think_tool", "ResearchComplete"])
     active_tools = []
 
     tool_names = []
     for tool in tools:
         tool_name = tool.name if hasattr(tool, "name") else tool.get("name", "web_search")
         # 永远保留思考节点，并挂载 Supervisor 准许的业务工具
-        if tool_name == "think_tool" or tool_name in allowed_tool_names:
+        if tool_name == "think_tool" or tool_name == "ResearchComplete" or tool_name in allowed_tool_names:
             tool_names.append(tool_name)
             active_tools.append(tool)
 
-    # if tool_names:
-        # print(f"\n[🔧 工具挂载] 激活专属工具: {tool_names}")
+    if tool_names:
+        print(f"\n[🔧 工具挂载] 激活专属工具: {tool_names}")
 
     # 精准挂载分配的技能
     assigned_skills = state.get("required_skills", [])
@@ -611,10 +619,10 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     if loaded_skills:
         active_tools.extend(loaded_skills)
         loaded_skill_names = [s.name for s in loaded_skills]
-        # print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
+        print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
 
     active_tool_names = [t.name if hasattr(t, "name") else t.get("name") for t in active_tools]
-    # print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
+    print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
 
     # 第2步：配置研究员模型及工具
     research_model_config = {
@@ -629,10 +637,14 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         date=get_today_str()
     )
 
+    # 如果是第一轮，死死锁住只能用 think_tool 思考；后续轮次强制要求必须调用任意工具（"any"）
+    current_iteration = state.get("tool_call_iterations", 0)
+    enforced_tool_choice = "think_tool" if current_iteration == 0 else "any"
+
     # 配置模型：绑定工具 + 重试逻辑 + 设置
     research_model = (
         configurable_model
-        .bind_tools(active_tools)
+        .bind_tools(active_tools, tool_choice=enforced_tool_choice)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(research_model_config)
     )
@@ -658,7 +670,6 @@ async def execute_tool_safely(tool, args, config):
     except Exception as e:
         return f"执行工具时出错：{str(e)}"
 
-
 async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "compress_research"]]:
     """执行研究员调用的工具，包括搜索工具和战略思考。
 
@@ -680,7 +691,13 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     researcher_messages = state.get("researcher_messages", [])
     most_recent_message = researcher_messages[-1]
 
-    # 如果没有工具调用则提前退出（包括原生网络搜索）
+    # 将超限熔断移到最前方，切断死循环
+    exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
+    if exceeded_iterations:
+        print(f"\n[🛑 强制中断] Researcher 迭代已达上限 ({configurable.max_react_tool_calls})，切断死循环，强制提纯。")
+        return Command(goto="compress_research")
+
+    # 如果没有工具调用，同样强制打回，禁止其提早进入 compress_research
     has_tool_calls = bool(most_recent_message.tool_calls)
     has_native_search = (
         openai_websearch_called(most_recent_message) or
@@ -688,7 +705,10 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     )
 
     if not has_tool_calls and not has_native_search:
-        return Command(goto="compress_research")
+        print("\n[拦截] Researcher 未调用工具，强制打回。")
+        warning_msg = HumanMessage(
+            content="[SYSTEM ERROR] You MUST call a tool (e.g., `web_search`, a skill, or `ResearchComplete`). Do not output plain conversational text.")
+        return Command(goto="researcher", update={"researcher_messages": [warning_msg]})
 
     # 第2步：处理工具调用（搜索、MCP 工具、skills等）
     tools = await get_all_tools(config)
@@ -708,12 +728,18 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         for tool in tools
     }
 
-    # 并行执行所有工具调用
+    # 加入安全执行闭包，防止 KeyError 崩溃
     tool_calls = most_recent_message.tool_calls
-    tool_execution_tasks = [
-        execute_tool_safely(tools_by_name[tool_call["name"]], tool_call["args"], config)
-        for tool_call in tool_calls
-    ]
+
+    async def safe_tool_runner(tc):
+        tool_name = tc["name"]
+        if tool_name not in tools_by_name:
+            print(f"\n[拦截] 拒绝未授权工具调用: {tool_name}")
+            return f"[System Error] Access Denied: Tool '{tool_name}' is not assigned to your current context. Please use ONLY the tools provided to you."
+        return await execute_tool_safely(tools_by_name[tool_name], tc["args"], config)
+
+    # 并行执行所有工具调用（包含非法调用的报错返回）
+    tool_execution_tasks = [safe_tool_runner(tc) for tc in tool_calls]
     observations = await asyncio.gather(*tool_execution_tasks)
 
     # 从执行结果创建工具消息
@@ -726,14 +752,13 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         for observation, tool_call in zip(observations, tool_calls)
     ]
 
-    # 第3步：检查延迟退出条件（处理完工具后）
-    exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
+    # 第3步：检查退出条件（处理完工具后）
     research_complete_called = any(
         tool_call["name"] == "ResearchComplete"
         for tool_call in most_recent_message.tool_calls
     )
 
-    if exceeded_iterations or research_complete_called:
+    if research_complete_called:
         # 结束研究并进入压缩阶段
         return Command(
             goto="compress_research",
@@ -809,6 +834,13 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                         if hasattr(response, 'facts'):
                             response.facts.append(chart_fact)
 
+            if response.facts:
+                facts_str = "\n".join(
+                    [f"- Entity: {getattr(f, 'entity', 'Unknown')} | Claim: {getattr(f, 'claim', '')}" for f in
+                     response.facts])
+            else:
+                facts_str = "No valid facts were extracted."
+
             # 提取当前子图中所有消息的 ID (包含庞大的 ToolMessage)
             delete_messages = [
                 RemoveMessage(id=m.id)
@@ -820,7 +852,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             return {
                 "staged_facts": response.facts,
                 "supervisor_messages": [ToolMessage(
-                    content=f"Successfully extracted {len(response.facts)} structured facts.",
+                    content=f"Successfully extracted {len(response.facts)} structured facts.\n\n[EXTRACTED DETAILS]:\n{facts_str}",
                     name="ConductResearch",
                     tool_call_id=state.get("tool_call_id", "")
                 )],
@@ -901,7 +933,7 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
 
     # 极简模式：只给模型看 Entity 和截断的 Claim，并附带明确的 ID (索引)
     formatted_findings = "\n".join([
-        f"Fact ID [{i}]: Entity: {getattr(f, 'entity', 'Unknown')} | Claim: {str(getattr(f, 'claim', ''))[:100]}..."
+        f"Fact ID [{i}]: Entity: {getattr(f, 'entity', 'Unknown')} | Claim: {str(getattr(f, 'claim', ''))[:200]}..."
         for i, f in enumerate(structured_facts)
     ])
 
@@ -912,8 +944,8 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
     )
 
     outline_model = configurable_model.with_structured_output(ReportOutline,method="json_mode").with_config({
-        "model": configurable.research_model,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "model": configurable.supervisor_model,
+        "api_key": get_api_key_for_model(configurable.supervisor_model, config),
         "tags": ["langsmith:nostream"]
     })
 
@@ -937,13 +969,13 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
 
     unassigned_indices = [i for i in range(len(structured_facts)) if i not in assigned_indices]
 
-    if unassigned_indices:
-        # 如果有被遗漏的事实，自动追加一个“补充发现”章节兜底
-        response.sections.append(SectionOutline(
-            section_title="补充调研发现",
-            description="其他重要的数据与事实补充。",
-            relevant_fact_indices=unassigned_indices
-        ))
+    # if unassigned_indices:
+    #     # 如果有被遗漏的事实，自动追加一个“补充发现”章节兜底
+    #     response.sections.append(SectionOutline(
+    #         section_title="补充调研发现",
+    #         description="其他重要的数据与事实补充。",
+    #         relevant_fact_indices=unassigned_indices
+    #     ))
 
     send_actions = []
     valid_sections = []  # 记录真正派发成功的有效章节

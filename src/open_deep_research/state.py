@@ -37,15 +37,13 @@ class ConductResearch(BaseModel):
     research_topic: str = Field(
         description="待调研的具体子主题。必须是单一主题，且需包含高度详尽的描述（至少一段话）。",
     )
-    # 技能清单，移除写死的工具枚举，要求依赖 search_tools_catalog 的结果
+    # 技能清单，要求依赖 search_tools_catalog 的结果
     required_tools: List[str] = Field(
         description="The specific tools this agent should have access to. For standard web search, use ['web_search', 'fetch_webpage']. For specialized tasks (e.g., RAG queries, DB queries, Git repos, internal docs), you MUST use the exact tool names returned by `search_tools_catalog`.",
-        default=["web_search", "fetch_webpage"]
     )
     # 技能分配字段
     required_skills: List[str] = Field(
         description="The specific native skills assigned to this agent. You MUST NOT guess skill names. You MUST query `search_tools_catalog` to discover available skills and use the exact names returned.",
-        default=[]
     )
 
 class ResearchComplete(BaseModel):
@@ -148,13 +146,6 @@ class SupervisorState(TypedDict):
     research_iterations: int = 0    # 循环安全锁。记录 Supervisor 已经派发了多少轮调研，达到上限时强制终止，防止死循环耗尽 API 额度。
     consecutive_low_gain_rounds: int = 0
 
-class WriteSectionState(TypedDict):
-    """并发写手节点的独立状态"""
-    section_title: str
-    section_description: str
-    assigned_facts: List[Dict[str, Any]]
-    research_brief: str
-
 class ResearcherState(TypedDict):
     """独立子调研员（Researcher）的私有执行状态。"""
 
@@ -172,3 +163,9 @@ class ResearcherOutputState(BaseModel):
     staged_facts: list[Fact]
     supervisor_messages: list[Any] # 用于将压缩完成的信号转化为 ToolMessage
 
+class WriteSectionState(TypedDict):
+    """并发写手节点的独立状态"""
+    section_title: str
+    section_description: str
+    assigned_facts: List[Dict[str, Any]]
+    research_brief: str

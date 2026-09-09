@@ -45,7 +45,12 @@ from open_deep_research.state import ResearchComplete
 # Tavily 搜索工具组件
 ##########################
 
-@tool(description="Search the web for news, facts, and public data. Returns titles, URLs, and concise snippets.")
+@tool(
+    description="""Search the web for news, facts, and public data. Returns titles, URLs, and concise snippets.
+    SEARCH STRATEGY 1 (Broad Recall): NEVER use overly long sentences or negative operators (like `-word`). Search for core positive keywords and filter manually.
+    SEARCH STRATEGY 2 (Site Operator): Use `site:` for specific domains/journals (e.g., `site:nature.com`).
+    SEARCH STRATEGY 3 (Anti-Contamination): Strictly AVOID AI benchmark datasets, GitHub issues, or LLM evaluation papers. Rely ONLY on primary sources."""
+)
 async def web_search(
         queries: List[str],
         max_results: Annotated[int, InjectedToolArg] = 5,
@@ -87,7 +92,9 @@ async def web_search(
 
 
 @tool(
-    description="Fetch and parse the full text of a specific URL into clean Markdown. Use this when snippets are insufficient.")
+    description="""Fetch and parse the full text of a specific URL into clean Markdown. 
+    RULE: ONLY call this on 1-2 high-authority URLs when snippets lack depth (e.g., financial tables, detailed specs). NEVER fetch every URL."""
+)
 async def fetch_webpage(url: str) -> str:
     """使用远端 Jina Reader 服务直接提取网页正文 Markdown。"""
     jina_url = f"https://r.jina.ai/{url}"
@@ -245,7 +252,8 @@ _python_repl = PythonREPL()
 @tool(
     description="""A highly capable quantitative analysis skill. 
     TRIGGER: Use this ANYTIME financial processing, math, stats, counts, or unit conversions are required.
-    RULE: DO NOT perform manual calculations or rounding yourself. You MUST explicitly write ALL math requirements into the 'calculation_goal' and pass the raw data as 'data_context' to get the execution result."""
+    RULE: You are FORBIDDEN from performing manual math, currency conversions, or statistical calculations yourself.
+    WORKFLOW: Gather raw data first -> Pass raw data as 'data_context' and calculation goal as 'calculation_goal' -> Wait for the Python sandbox output. Your research task is NOT COMPLETE until you receive the final numerical output."""
 )
 async def quantitative_analysis_skill(data_context: str, calculation_goal: str, config: RunnableConfig = None) -> str:
     """
@@ -312,9 +320,10 @@ async def quantitative_analysis_skill(data_context: str, calculation_goal: str, 
 
 
 @tool(
-    description="""A Sub-RAG skill for deep mining of EXTREMELY LONG documents.
-    TRIGGER: Use this ANYTIME the source is an extremely long document (e.g., annual reports, SEC filings, PDFs, academic papers) where 'fetch_webpage' is insufficient.
-    RULE: Pass the specific 'url' and a highly detailed 'extraction_query'. It will read the entire document in the background and extract the exact answer."""
+    description="""A Sub-RAG skill for deep mining of EXTREMELY LONG documents (PDFs, massive HTML Changelogs).
+    TRIGGER: Use this when a source is an extremely long report where 'fetch_webpage' is insufficient due to length limits.
+    WORKFLOW & RULE: Discover the document URL via `web_search` -> Pass the URL and your query to this skill. 
+    CRITICAL QUERY RULE: The backend uses lexical keyword matching (BM25). DO NOT pass abstract conversational questions (e.g., "what other predictor base command..."). You MUST pass a highly optimized, keyword-rich query containing synonyms, base class names, and wildcards (e.g., "bug fix BaseEstimator BaseLabelPropagation base command predictor")."""
 )
 async def long_doc_mining_skill(url: str, extraction_query: str, config: RunnableConfig = None) -> str:
     """
@@ -371,7 +380,7 @@ async def long_doc_mining_skill(url: str, extraction_query: str, config: Runnabl
         # 3. 本地 BM25 召回最相关的 Top-5 块 (不耗费任何 API Token)
         docs = [Document(page_content=chunk) for chunk in chunks]
         retriever = BM25Retriever.from_documents(docs)
-        retriever.k = 5
+        retriever.k = 10
         top_docs = retriever.invoke(extraction_query)
         context = "\n\n---\n\n".join([d.page_content for d in top_docs])
 
@@ -413,10 +422,11 @@ async def long_doc_mining_skill(url: str, extraction_query: str, config: Runnabl
         return f"[❌ Skill Failed] LLM extraction error: {str(e)}"
 
 @tool(
-    description="""A specialized Data Visualization skill.
-    TRIGGER: Use this ANYTIME you need to create charts, graphs, or visual data representations (e.g., comparing revenue, market share).
-    RULE: Freehand drawing is strictly forbidden. 
-    INPUT: Pass raw numerical data as 'data_context' and a very simple chart design goal as 'visualization_goal'."""
+    description="""A specialized Data Visualization skill to generate industrial-grade chart images via API.
+    TRIGGER: Use this ANYTIME you need to create charts, graphs, or visual data representations.
+    RULE: Freehand ASCII/Markdown painting is strictly forbidden. 
+    WARNING: Keep your 'visualization_goal' EXTREMELY SIMPLE (e.g., "Compare 2023 revenue between Apple and Microsoft"). DO NOT ask for custom colors, dual Y-axes, or matplotlib styles.
+    WORKFLOW: Gather all required numerical data -> Pass the raw data and your simple chart design goal -> Wait for the generated Markdown image link (e.g., `![chart](url)`)."""
 )
 async def data_visualization_skill(data_context: str, visualization_goal: str, config: RunnableConfig = None) -> str:
     """
@@ -505,9 +515,9 @@ async def data_visualization_skill(data_context: str, visualization_goal: str, c
 
 # 在这里注册所有可用的复合技能
 AVAILABLE_SKILLS = {
-    "quantitative_analysis": quantitative_analysis_skill,
-    "long_doc_mining": long_doc_mining_skill,
-    "data_visualization": data_visualization_skill
+    "quantitative_analysis_skill": quantitative_analysis_skill,
+    "long_doc_mining_skill": long_doc_mining_skill,
+    "data_visualization_skill": data_visualization_skill
 }
 
 def get_active_skills(assigned_skill_names: List[str]) -> List[Any]:
@@ -556,8 +566,19 @@ async def search_tools_catalog(query: str, config: RunnableConfig = None) -> str
     except Exception as e:
         catalog_info += f"(Failed to load MCP integrations: {str(e)})\n\n"
 
-    catalog_info += "INSTRUCTION: Assign native skills to `required_skills` and MCP tools to `required_tools` in `ConductResearch` based on these exact names."
-    return catalog_info
+        # 手把手教大模型怎么填 JSON
+        catalog_info += "=" * 40 + "\n"
+        catalog_info += "🚨 CRITICAL INSTRUCTION FOR DELEGATION 🚨\n"
+        catalog_info += "When you call `ConductResearch`, you MUST explicitly inject the exact names above into your JSON arguments.\n"
+        catalog_info += "Example JSON structure:\n"
+        catalog_info += "{\n"
+        catalog_info += '  "research_topic": "Find X...",\n'
+        catalog_info += '  "required_tools": ["web_search", "fetch_webpage", "your_mcp_tool_here"],\n'
+        catalog_info += '  "required_skills": ["long_doc_mining_skill"]\n'
+        catalog_info += "}\n"
+        catalog_info += "If you omit this, your sub-agent will fail to process complex tasks!"
+
+        return catalog_info
 
 ##########################
 # 模型供应商原生网络搜索组件
@@ -902,8 +923,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
         api_keys = config.get("configurable", {}).get("apiKeys", {})
         if not api_keys:
             return None
-        if model_name.startswith("openai:deepseek"):
-            return api_keys.get("DEEPSEEK_API_KEY")
+        # if model_name.startswith("openai:deepseek"):
+        #     return api_keys.get("DEEPSEEK_API_KEY")
         elif model_name.startswith("openai:"):
             return api_keys.get("OPENAI_API_KEY")
         elif model_name.startswith("qwen"):
@@ -914,9 +935,9 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("GOOGLE_API_KEY")
         return None
     else:
-        if model_name.startswith("openai:deepseek"):
-            return os.getenv("DEEPSEEK_API_KEY")
-        elif model_name.startswith("openai:"):
+        # if model_name.startswith("openai:deepseek"):
+        #     return os.getenv("DEEPSEEK_API_KEY")
+        if model_name.startswith("openai:"):
             return os.getenv("OPENAI_API_KEY")
         elif model_name.startswith("qwen"):
             return os.getenv("DASHSCOPE_API_KEY")
