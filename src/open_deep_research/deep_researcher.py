@@ -109,7 +109,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     # 配置模型：结构化输出 + 重试逻辑
     clarification_model = (
         configurable_model
-        .with_structured_output(ClarifyWithUser,method="json_mode")
+        .with_structured_output(ClarifyWithUser)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(model_config)
     )
@@ -140,7 +140,7 @@ async def route_task(state: AgentState, config: RunnableConfig) -> Command[
     Literal["write_research_brief", "direct_answering"]]:
     """智能路由节点：判断是走检索流水线，还是直接走逻辑推理。"""
     configurable = Configuration.from_runnable_config(config)
-    model = configurable_model.with_structured_output(TaskRouting, method="json_mode").with_config({
+    model = configurable_model.with_structured_output(TaskRouting).with_config({
         "model": configurable.supervisor_model,
         "max_tokens": configurable.supervisor_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.supervisor_model, config),
@@ -161,15 +161,22 @@ async def route_task(state: AgentState, config: RunnableConfig) -> Command[
 async def direct_answering(state: AgentState, config: RunnableConfig) -> Command[Literal["__end__"]]:
     """短路推理节点：用于回答纯逻辑和数学题。"""
     configurable = Configuration.from_runnable_config(config)
-    model = configurable_model.with_config({
+    model = configurable_model.with_retry(stop_after_attempt=3).with_config({
         "model": configurable.logical_reasoning_model,
         "max_tokens": configurable.logical_reasoning_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.logical_reasoning_model, config),
+        "temperature": 0.6,  # DeepSeek 官方推荐 R1 推理温度
     })
 
     prompt = direct_answering_prompt.format(problem=get_buffer_string(state.get("messages", [])))
 
     response = await model.ainvoke([HumanMessage(content=prompt)])
+
+    final_text = response.content
+
+    # 物理剥离思维链，确保自动化评测脚本能直接抓取到最后的纯净答案
+    if "<think>" in final_text:
+        final_text = re.sub(r'<think>.*?(?:</think>|$)', '', final_text, flags=re.DOTALL).strip()
 
     return Command(
         goto=END,
@@ -204,7 +211,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     # 配置模型：结构化输出 + 重试逻辑
     research_model = (
         configurable_model
-        .with_structured_output(ResearchQuestion,method="json_mode")
+        .with_structured_output(ResearchQuestion)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(research_model_config)
     )
@@ -266,7 +273,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
 
     # 如果是第一轮，死死锁住只能用 think_tool 思考；后续轮次强制要求必须调用任意工具（"any"）
     current_iteration = state.get("research_iterations", 0)
-    enforced_tool_choice = "think_tool" if current_iteration == 0 else "any"
+    enforced_tool_choice = "think_tool" if current_iteration == 0 else "required"
 
     # 配置模型：绑定工具 + 重试逻辑 + 模型设置
     research_model = (
@@ -331,11 +338,26 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     if exceeded_allowed_iterations or should_end_research:
         return Command(goto=END, update={"structured_facts": state.get("structured_facts", [])})
 
-    # 如果模型忘记调工具，强制打回，而不是结束！
+        # 在 supervisor_tools 函数内，处理 no_tool_calls 的地方修改如下：
+
     if no_tool_calls:
-        print("\n[拦截] Supervisor 未调用工具，强制打回要求调用工具。")
+        # 计算历史消息中连续出现了多少次我们的 [SYSTEM ERROR] 拦截警告
+        consecutive_errors = 0
+        for msg in reversed(supervisor_messages):
+            if isinstance(msg, HumanMessage) and "[SYSTEM ERROR] You MUST execute a tool call" in msg.content:
+                consecutive_errors += 1
+            else:
+                break
+
+        # 【断路器】：如果大模型已经连续 3 次死活不调工具（听不懂人话），强行踢出循环！
+        if consecutive_errors >= 3:
+            print("\n[🛑 强制熔断] Supervisor 连续 3 次拒绝调用工具，触发断路器，强制结束调研！")
+            return Command(goto=END, update={"structured_facts": state.get("structured_facts", [])})
+
+        # 如果还在容忍范围内，继续打回
+        print(f"\n[拦截] Supervisor 输出了纯文本，强制打回 (第 {consecutive_errors + 1}/3 次警告)。")
         warning_msg = HumanMessage(
-            content="[SYSTEM ERROR] You MUST execute a tool call. Do not just output conversational text. Please call `think_tool`")
+            content="[SYSTEM ERROR] You MUST execute a tool call. Do not just output conversational text. Please call `think_tool`, `search_tools_catalog`, `ConductResearch`, or `ResearchComplete`. If you need to plan, put your text INSIDE the `think_tool` arguments!")
         return Command(goto="supervisor", update={"supervisor_messages": [warning_msg]})
 
     # 第2步：同时处理所有工具调用（包括 think_tool 和 ConductResearch）
@@ -609,8 +631,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
             tool_names.append(tool_name)
             active_tools.append(tool)
 
-    if tool_names:
-        print(f"\n[🔧 工具挂载] 激活专属工具: {tool_names}")
+    # print(f"\n[🔧 工具挂载] 激活专属工具: {tool_names}")
 
     # 精准挂载分配的技能
     assigned_skills = state.get("required_skills", [])
@@ -619,10 +640,10 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     if loaded_skills:
         active_tools.extend(loaded_skills)
         loaded_skill_names = [s.name for s in loaded_skills]
-        print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
+        # print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
 
     active_tool_names = [t.name if hasattr(t, "name") else t.get("name") for t in active_tools]
-    print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
+    # print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
 
     # 第2步：配置研究员模型及工具
     research_model_config = {
@@ -639,7 +660,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
 
     # 如果是第一轮，死死锁住只能用 think_tool 思考；后续轮次强制要求必须调用任意工具（"any"）
     current_iteration = state.get("tool_call_iterations", 0)
-    enforced_tool_choice = "think_tool" if current_iteration == 0 else "any"
+    enforced_tool_choice = "think_tool" if current_iteration == 0 else "required"
 
     # 配置模型：绑定工具 + 重试逻辑 + 设置
     research_model = (
@@ -651,7 +672,30 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
 
     # 第3步：使用系统上下文生成研究员响应
     messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
-    response = await research_model.ainvoke(messages)
+    try:
+        response = await research_model.ainvoke(messages)
+    except Exception as e:
+        error_msg = str(e)
+        if "JSON format" in error_msg or "400" in error_msg or "invalid_parameter_error" in error_msg:
+            # 统计历史上已经报过几次 SYSTEM ERROR
+            error_count = sum(1 for m in researcher_messages if
+                              getattr(m, "type", "") == "human" and "[SYSTEM ERROR]" in getattr(m, "content", ""))
+
+            if error_count >= 2:  # 已经是第 3 次犯错了
+                print("\n[🛑 强制熔断] Researcher 累计 3 次 JSON 崩溃，触发断路器，强制退回！")
+                # 塞入一条失败记录，让 compress_research 知道任务失败了
+                from langchain_core.messages import AIMessage
+                failure_msg = AIMessage(
+                    content="[CRITICAL FAILURE] Task aborted due to repeated JSON formatting errors.")
+                return Command(goto="compress_research", update={"researcher_messages": [failure_msg]})
+            else:
+                print(f"\n[容错拦截] 大模型生成的工具 JSON 格式损坏，强制要求其重试 (第 {error_count + 1}/3 次)。")
+                warning_msg = HumanMessage(
+                    content="[SYSTEM ERROR] Your previous tool call failed because the arguments were not valid JSON. Please generate valid JSON arguments and try again. Do not output plain text.")
+                return Command(goto="researcher", update={"researcher_messages": [warning_msg]})
+        else:
+            # 如果是其他未知错误（如断网、API 欠费），则抛出
+            raise e
 
     # 第4步：更新状态并继续进入工具执行
     return Command(
@@ -705,7 +749,15 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     )
 
     if not has_tool_calls and not has_native_search:
-        print("\n[拦截] Researcher 未调用工具，强制打回。")
+        # 统计历史上已经报过几次 SYSTEM ERROR
+        error_count = sum(1 for m in researcher_messages if
+                          getattr(m, "type", "") == "human" and "[SYSTEM ERROR]" in getattr(m, "content", ""))
+
+        if error_count >= 2:  # 已经是第 3 次犯错了
+            print("\n[🛑 强制熔断] Researcher 累计 3 次拒绝调用工具，触发断路器，强制退回！")
+            return Command(goto="compress_research")
+
+        print(f"\n[拦截] Researcher 未调用工具，强制打回 (第 {error_count + 1}/3 次)。")
         warning_msg = HumanMessage(
             content="[SYSTEM ERROR] You MUST call a tool (e.g., `web_search`, a skill, or `ResearchComplete`). Do not output plain conversational text.")
         return Command(goto="researcher", update={"researcher_messages": [warning_msg]})
@@ -795,7 +847,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
 
     structured_synthesizer_model = (
         configurable_model
-        .with_structured_output(FactBoard, method="json_mode")
+        .with_structured_output(FactBoard)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
         .with_config(model_config)
     )
@@ -943,7 +995,7 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
         date=get_today_str()
     )
 
-    outline_model = configurable_model.with_structured_output(ReportOutline,method="json_mode").with_config({
+    outline_model = configurable_model.with_structured_output(ReportOutline).with_config({
         "model": configurable.supervisor_model,
         "api_key": get_api_key_for_model(configurable.supervisor_model, config),
         "tags": ["langsmith:nostream"]
@@ -1013,55 +1065,65 @@ async def generate_outline(state: AgentState, config: RunnableConfig) -> Command
                 "section_drafts": {"type": "override", "value": []}}
     )
 
+# 全局并发信号量：限制同一时间最多只允许 2 个章节并发撰写，防止击穿 API 并发上限
+writer_semaphore = asyncio.Semaphore(20)
 
 async def write_section(state: WriteSectionState, config: RunnableConfig):
     """并发写手节点：利用分配到的极少量事实撰写局部章节。"""
-    configurable = Configuration.from_runnable_config(config)
+    # 利用信号量强制排队，即使 LangGraph 瞬间下发 6 个任务，也只允许 2 个同时请求 API
+    async with writer_semaphore:
+        configurable = Configuration.from_runnable_config(config)
 
-    # 提前把分配给这个章节的图表链接提取出来备用
-    chart_links = []
-    for f in state["assigned_facts"]:
-        claim = getattr(f, 'claim', '')
-        # 寻找形如 ![alt](url) 的 Markdown 图片
-        match = re.search(r'(!\[.*?\]\(.*?\))', claim)
-        if match:
-            chart_links.append(match.group(1))
+        # 提前把分配给这个章节的图表链接提取出来备用
+        chart_links = []
+        for f in state["assigned_facts"]:
+            claim = getattr(f, 'claim', '')
+            # 寻找形如 ![alt](url) 的 Markdown 图片
+            match = re.search(r'(!\[.*?\]\(.*?\))', claim)
+            if match:
+                chart_links.append(match.group(1))
 
-    # 使用 global_id 作为事实的明显标识
-    formatted_findings = "\n".join([
-        f"Fact [{f['global_id']}]: Entity: {f.get('entity', '')} | Claim: {f.get('claim', '')} | Source: {f.get('source', '')}"
-        for f in state["assigned_facts"]
-    ])
+        # 使用 global_id 作为事实的明显标识
+        formatted_findings = "\n".join([
+            f"Fact [{f['global_id']}]: Entity: {f.get('entity', '')} | Claim: {f.get('claim', '')} | Source: {f.get('source', '')}"
+            for f in state["assigned_facts"]
+        ])
 
-    prompt = write_section_prompt.format(
-        research_brief=state["research_brief"],
-        section_title=state["section_title"],
-        section_description=state["section_description"],
-        findings=formatted_findings,
-        date=get_today_str()
-    )
-
-    writer_model = configurable_model.with_config({
-        "model": configurable.writer_model,
-        "max_tokens": 4000,
-        "api_key": get_api_key_for_model(configurable.writer_model, config)
-    })
-
-    section_content = await writer_model.ainvoke([HumanMessage(content=prompt)])
-    final_text = section_content.content
-
-    # 检查大模型是否漏掉了图表或篡改了链接
-    for chart in chart_links:
-        if chart not in final_text:
-            # 如果原封不动的图表链接不在正文里，说明大模型犯病了，我们强行补在章节最后
-            final_text += f"\n\n{chart}\n\n"
-
-    return {
-        "section_drafts": [SectionDraft(
+        prompt = write_section_prompt.format(
+            research_brief=state["research_brief"],
             section_title=state["section_title"],
-            content=final_text
-        )]
-    }
+            section_description=state["section_description"],
+            findings=formatted_findings,
+            date=get_today_str()
+        )
+
+        writer_model = configurable_model.with_retry(stop_after_attempt=3, wait_exponential_jitter=True).with_config({
+            "model": configurable.writer_model,
+            "max_tokens": configurable.writer_model_max_tokens,
+            "temperature": 0.6,  # 推荐 R1 写作/推理使用的温度
+            "api_key": get_api_key_for_model(configurable.writer_model, config),
+            "tags": ["langsmith:nostream"]
+        })
+
+        section_content = await writer_model.ainvoke([HumanMessage(content=prompt)])
+        final_text = section_content.content
+
+        # 在后端物理剥离 R1 模型的 <think> 标签，防止污染最终报告
+        if "<think>" in final_text:
+            final_text = re.sub(r'<think>.*?(?:</think>|$)', '', final_text, flags=re.DOTALL).strip()
+
+        # 检查大模型是否漏掉了图表或篡改了链接
+        for chart in chart_links:
+            if chart not in final_text:
+                # 如果原封不动的图表链接不在正文里，说明大模型犯病了，我们强行补在章节最后
+                final_text += f"\n\n{chart}\n\n"
+
+        return {
+            "section_drafts": [SectionDraft(
+                section_title=state["section_title"],
+                content=final_text
+            )]
+        }
 
 async def assemble_report(state: AgentState, config: RunnableConfig) -> Command[Literal["report_verifier"]]:
     """组装节点 (Reduce)：将并发生成的章节按大纲顺序拼合，并生成统一引用。"""
@@ -1105,7 +1167,7 @@ async def report_verifier(state: AgentState, config: RunnableConfig) -> Command[
 
     # 2. 配置核查模型（选用推理能力强、成本适度的小/中模型）
     verifier_model = (configurable_model
-      .with_structured_output(VerificationReport, method="json_mode")
+      .with_structured_output(VerificationReport)
       .with_config({
         "model": configurable.verifier_model,
         "max_tokens": configurable.verifier_model_max_tokens,
@@ -1160,9 +1222,9 @@ async def rewrite_report(state: AgentState, config: RunnableConfig) -> Command[L
     )
 
     writer_model_config = {
-        "model": configurable.writer_model,
-        "max_tokens": configurable.writer_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.writer_model, config),
+        "model": configurable.logical_reasoning_model,
+        "max_tokens": configurable.logical_reasoning_model_max_tokens,
+        "api_key": get_api_key_for_model(configurable.logical_reasoning_model, config),
         "tags": ["langsmith:nostream"]
     }
 

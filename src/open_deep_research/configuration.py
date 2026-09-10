@@ -106,11 +106,11 @@ class Configuration(BaseModel):
         }
     )
     max_researcher_iterations: int = Field(
-        default=6,
+        default=15,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
-                "default": 6,
+                "default": 15,
                 "min": 1,
                 "max": 10,
                 "step": 1,
@@ -119,7 +119,7 @@ class Configuration(BaseModel):
         }
     )
     max_react_tool_calls: int = Field(
-        default=10,
+        default=15,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
@@ -203,11 +203,11 @@ class Configuration(BaseModel):
         }
     )
     writer_model_max_tokens: int = Field(
-        default=8192,
+        default=30000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 8192,
+                "default": 30000,
                 "description": "Maximum output tokens for final report model"
             }
         }
@@ -223,11 +223,11 @@ class Configuration(BaseModel):
         }
     )
     verifier_model_max_tokens: int = Field(
-        default=4000,
+        default=16000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 4000,
+                "default": 16000,
                 "description": "Maximum output tokens for verifier model"
             }
         }
@@ -243,11 +243,11 @@ class Configuration(BaseModel):
         }
     )
     logical_reasoning_model_max_tokens: int = Field(
-        default=10000,
+        default=50000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 10000,
+                "default": 50000,
                 "description": "Maximum output tokens for logical reasoning model"
             }
         }

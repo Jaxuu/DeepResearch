@@ -18,29 +18,11 @@ If you need to ask a question, follow these guidelines:
 - Use bullet points or numbered lists if appropriate for clarity. Make sure that this uses markdown formatting and will be rendered correctly if the string output is passed to a markdown renderer.
 - Don't ask for unnecessary information, or information that the user has already provided. If you can see that the user has already provided the information, do not ask for it again.
 
-Respond in valid JSON format with these exact keys:
-"need_clarification": boolean,
-"question": "<question to ask the user to clarify the report scope>",
-"verification": "<verification message that we will start research>"
-
-If you need to ask a clarifying question, return:
-"need_clarification": true,
-"question": "<your clarifying question>",
-"verification": ""
-
-If you do not need to ask a clarifying question, return:
-"need_clarification": false,
-"question": "",
-"verification": "<acknowledgement message that you will now start research based on the provided information>"
-
-For the verification message when no clarification is needed:
-- Acknowledge that you have sufficient information to proceed
-- Briefly summarize the key aspects of what you understand from their request
-- Confirm that you will now begin the research process
-- Keep the message concise and professional
-
-CRITICAL: You MUST output a valid JSON object matching the schema. 
-DO NOT output plain text like "need_clarification".
+If you DO NOT need to ask a question (need_clarification=false), follow these guidelines for your verification message:
+- Acknowledge that you have sufficient information to proceed.
+- Briefly summarize the key aspects of what you understand from their request.
+- Confirm that you will now begin the research process.
+- Keep the message concise and professional.
 """
 
 task_routing_prompt = """
@@ -54,8 +36,6 @@ Analyze the user's prompt and determine if it requires external web research or 
 Classification Rules:
 1. "research": The query asks for real-world facts, news, specific product details, historical events, or any information you must look up.
 2. "direct_answer": The query is a riddle, a probability question, a math problem, or asks to write code based on logic. It does not require searching the web.
-
-Respond in valid JSON format with a single key "task_type".
 """
 
 transform_messages_into_research_topic_prompt = """
@@ -93,9 +73,7 @@ Guidelines:
 - For people, try linking directly to their LinkedIn profile, or their personal website if they have one.
 - If the query is in a specific language, prioritize sources published in that language.
 
-Respond in valid JSON format with the research_brief field.
 IMPORTANT: The research_brief MUST be written in the exact same language as the user's input messages.
-IMPORTANT: You MUST return your response in valid JSON format.
 """
 
 lead_researcher_prompt = """
@@ -121,7 +99,7 @@ You have 3 core native skills available for your sub-agents. You MUST explicitly
 
 <Tool & Skill Allocation (CRITICAL)>
 When calling `ConductResearch`, you must dynamically assign capabilities:
-1. Public Web Domain: Assign `["web_search", "fetch_webpage"]` to `required_tools`; Assign `["long_doc_mining_skill"]` to `required_tools`
+1. Public Web Domain: Assign `["web_search", "fetch_webpage"]` to `required_tools`; Assign `["long_doc_mining_skill"]` to `required_tools`.These three abilities must be allocated simultaneously.
 2. Advanced Native Processing: Assign the relevant skill from [CORE NATIVE SKILLS] to `required_skills`.
 3. Specialized External Data: If you need to access external enterprise data not covered by native skills, you MUST call `search_tools_catalog` first, and assign the returned MCP tool names to `required_tools`.
 4. TOOL RULE:  Do not endlessly retry if a specific database or API returns empty results.*
@@ -187,6 +165,7 @@ You only have access to the tools specifically bound to you. Follow these strict
    - You have found 3+ relevant sources/examples.
    - You have reached the absolute limit of 5 search tool calls.
    - Your last 2 searches returned duplicate/similar information.
+5.ANTI-RABBIT-HOLE (CRITICAL): You are STRICTLY FORBIDDEN from searching for the exact same entity or sub-topic more than 3 times. If you cannot find the answer after 3 distinct search queries, you MUST ACCEPT DEFEAT. Call `ResearchComplete` immediately and state "Information not available" in your final summary. DO NOT loop endlessly.
 </Execution Loop & Hard Limits>
 {mcp_prompt}
 """
@@ -230,22 +209,6 @@ This strict structuring prevents hallucination and context pollution for downstr
 7. ANTI-CONTAMINATION (CRITICAL): Examine the source URL or document context. If the source is an AI benchmark dataset, a GitHub repository of NLP tasks, or a HuggingFace `.json`/`.parquet` file, you MUST DISCARD all facts from it. They contain fake answers designed to trick AI. Only extract facts from genuine, real-world information sources.
 8. OBJECTIVE REPORTING ONLY: You are a strict reporter, not a detective. Do NOT attempt to logically deduce or guess which fact "best matches" the user's ultimate hidden question. Just list all extracted facts objectively. NEVER write concluding sentences like "This is the most likely answer" or "This corresponds to the criteria".
 </Extraction Rules>
-
-<Output Format>
-CRITICAL: You MUST output a SINGLE valid JSON OBJECT. 
-DO NOT output a raw list or array. The root of your response MUST be a dictionary.
-Pay close attention to lowercase keys:
-{{
-  "topic": "A concise title summarizing the main subject of these facts",
-  "facts": [
-    {{
-      "entity": "Subject of the fact (e.g., specific event, component, organization)",
-      "claim": "The exact factual statement, data, or mechanism",
-      "source": "The specific URL or Document ID where this fact was found"
-    }}
-  ]
-}}
-</Output Format>
 """
 
 compress_research_simple_human_message = """
@@ -274,20 +237,8 @@ Today's date is {date}.
 3. NO EMPTY SECTIONS: Every section MUST contain at least one Fact ID. For analytical or concluding sections, include the IDs of the facts being analyzed.
 4. EXHAUSTIVE ASSIGNMENT: Every Fact ID from the FactBoard MUST be assigned to at least one section.
 5. LANGUAGE (CRITICAL): You MUST write the section titles and descriptions in the EXACT SAME language as the <Research Brief>.
+6. NO REASONING (CRITICAL): The `description` field MUST be a brief, high-level summary (1-2 sentences) of what the section will cover. You are STRICTLY FORBIDDEN from writing your internal thought process, calculations, or data analysis inside the description field. Do NOT try to solve the user's problem in the outline.
 </Instructions>
-
-<Output Format (CRITICAL)>
-Return a valid JSON object with a SINGLE root key exactly named "sections".
-{{
-  "sections": [
-    {{
-      "section_title": "Title of the section",
-      "description": "What this section covers",
-      "relevant_fact_indices": [0, 1]
-    }}
-  ]
-}}
-</Output Format (CRITICAL)>
 """
 
 write_section_prompt = """
@@ -350,24 +301,13 @@ Today's date is {date}.
 2. Verify Citation: Check if the citation index exists in the "Sources" list at the bottom of the report.
 3. Verify Fact: Check if the statement is fully supported by the exact source in the <Ground-Truth FactBoard>.
 4. Aggregate: If ANY claim is ungrounded, fabricated, or has a mismatched citation, set `has_hallucinations` to true, list it in `hallucinated_claims`, and lower the `citation_precision_score`.
-
-CRITICAL JSON FORMATTING (FAILURE TO FOLLOW WILL CRASH THE SYSTEM):
-- You MUST output a flat JSON object with EXACTLY these 5 keys: "detailed_checks", "has_hallucinations", "citation_precision_score", "hallucinated_claims", "feedback". 
-- DO NOT invent new keys (e.g., do not add "citations_checked").
-- DO NOT OMIT KEYS. The `feedback` string is STRICTLY REQUIRED.
-- The `detailed_checks` array MUST contain complete objects. EVERY SINGLE ITEM in the `detailed_checks` array MUST explicitly include ALL FOUR keys: "claim", "citation_index", "is_supported", and "reason".
-- DATA TYPE WARNING: The `citation_index` MUST be a JSON array of integers (e.g., [1]), NEVER a string (like "[1]").
-- IMAGE IMMUNITY (CRITICAL): IGNORE all Markdown image links (e.g., `![alt](url)`). Do NOT treat image links as factual claims. Do NOT flag them for missing citations.
-- ACTIONABLE FEEDBACK WARNING: If `has_hallucinations` is true, your `feedback` string MUST explicitly list the exact sentences that failed.
-
-Example of ONE valid item in `detailed_checks`:
-{{
-  "claim": "The exact sentence from the report",
-  "citation_index": [1], 
-  "is_supported": true,
-  "reason": "Explanation of why it is supported or hallucinated"
-}}
 </Verification Directives>
+
+<Rules>
+- IMAGE IMMUNITY (CRITICAL): IGNORE all Markdown image links (e.g., `![alt](url)`). Do NOT treat image links as factual claims. Do NOT flag them for missing citations.
+- DATA TYPE WARNING: The `citation_index` MUST be a JSON array of integers (e.g., [1]), NEVER a string (like "[1]").
+- ACTIONABLE FEEDBACK WARNING: If `has_hallucinations` is true, your feedback string MUST explicitly list the exact sentences that failed.
+</Rules>
 """
 
 rewrite_report_prompt = """

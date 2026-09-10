@@ -61,11 +61,11 @@ async def extract_final_answer(question: str, report: str) -> str:
 
 async def main():
     # 读取本地的自定义测试集-
-    dataset_path = os.path.join("../datasets/custom_dataset.json")
+    dataset_path = os.path.join("../datasets/failed_sample.json")
     with open(dataset_path, "r", encoding="utf-8") as f:
         original_dataset = json.load(f)
 
-    dataset = original_dataset[:5]
+    dataset = original_dataset[:]
     correct_count = 0
     total_tests = len(dataset)
 
