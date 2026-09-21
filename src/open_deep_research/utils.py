@@ -1,4 +1,5 @@
 """Deep Research 智能体的实用工具与辅助函数。"""
+import base64
 
 import asyncio
 import json
@@ -16,7 +17,8 @@ import urllib.parse
 from tavily import AsyncTavilyClient
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
-
+from playwright.sync_api import sync_playwright
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -513,11 +515,63 @@ async def data_visualization_skill(data_context: str, visualization_goal: str, c
 
     return "[❌ Skill Failed]"
 
+
+
+
+
+@tool
+def visual_layout_analysis_skill(url: str, specific_question: str) -> str:
+    """
+    A visual analysis skill. Use this to analyze the physical layout, colors, or typography of a webpage.
+    Args:
+        url: The webpage URL to analyze.
+        specific_question: What exactly to look for (e.g., "Which stanza has indented lines?").
+    """
+    # 1. 使用 Playwright 启动无头浏览器并截图
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            screenshot_bytes = page.screenshot(full_page=True)
+            browser.close()
+    except Exception as e:
+        return f"Failed to capture webpage: {str(e)}"
+
+    # 2. 将截图转换为 Base64
+    base64_image = base64.b64encode(screenshot_bytes).decode('utf-8')
+
+    # 3. 调用阿里云百炼的 Qwen-VL 模型看图
+    # 注意：需配置百炼的 BASE_URL 和 API_KEY
+    vision_llm = ChatOpenAI(
+        model=os.getenv("VISUAL_MODEL"),
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
+
+    message = HumanMessage(
+        content=[
+            {"type": "text",
+             "text": f"You are a visual layout expert. Analyze this webpage screenshot and answer: {specific_question}. Pay strict attention to CSS styling, indentations, and spatial arrangement."},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+            }
+        ]
+    )
+
+    # 4. 获取视觉模型的文本描述
+    response = vision_llm.invoke([message])
+
+    # 5. 将文本描述返回给主流程的文本 Agent
+    return f"Visual Analysis Result for {url}:\n{response.content}"
+
 # 在这里注册所有可用的复合技能
 AVAILABLE_SKILLS = {
     "quantitative_analysis_skill": quantitative_analysis_skill,
     "long_doc_mining_skill": long_doc_mining_skill,
-    "data_visualization_skill": data_visualization_skill
+    "data_visualization_skill": data_visualization_skill,
+    "visual_layout_analysis_skill": visual_layout_analysis_skill
 }
 
 def get_active_skills(assigned_skill_names: List[str]) -> List[Any]:

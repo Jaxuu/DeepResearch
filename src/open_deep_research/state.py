@@ -47,7 +47,10 @@ class ConductResearch(BaseModel):
     )
 
 class ResearchComplete(BaseModel):
-    """调用此工具表示所有调研工作已完成。"""
+    """调用此工具表示所有调研工作已完成，并提交最终的结论。"""
+    final_answer: str = Field(
+        description="The final, definitive answer to the user's original query based on your research and calculations. Keep it extremely concise and formatted EXACTLY as the user requested."
+    )
 
 class Fact(BaseModel):
     """从检索内容中提纯的最小知识单元"""

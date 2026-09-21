@@ -26,7 +26,7 @@ from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
     compress_research_system_prompt,
-    lead_researcher_prompt,
+    supervisor_prompt,
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
     report_verifier_prompt,
@@ -224,7 +224,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
 
     # 第3步：使用研究简报和指令初始化主管智能体
-    supervisor_system_prompt = lead_researcher_prompt.format(
+    supervisor_system_prompt = supervisor_prompt.format(
         date=get_today_str(),
         max_concurrent_research_units=configurable.max_concurrent_research_units,
         max_researcher_iterations=configurable.max_researcher_iterations
@@ -328,17 +328,33 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         if tool_call["name"] == "ConductResearch"
     ]
 
-    # 只有在【没有派发新任务】的前提下，完成信号才生效
-    research_complete_called = any(
-        tool_call["name"] == "ResearchComplete" for tool_call in most_recent_message.tool_calls
-    )
-    should_end_research = research_complete_called and not conduct_research_calls
+    # 必须用列表推导式提取出完整的 tool_call 对象，绝对不能用 any()
+    research_complete_calls = [
+        tc for tc in most_recent_message.tool_calls
+        if tc["name"] == "ResearchComplete"
+    ]
+
+    # 只有在没有派发新任务的前提下，完成信号才生效
+    should_end_research = bool(research_complete_calls) and not conduct_research_calls
 
     # 如果迭代超限 或 主动调用了完成，则正常退出
     if exceeded_allowed_iterations or should_end_research:
-        return Command(goto=END, update={"structured_facts": state.get("structured_facts", [])})
+        facts = state.get("structured_facts", [])
 
-        # 在 supervisor_tools 函数内，处理 no_tool_calls 的地方修改如下：
+        # 拦截 Supervisor 的最终答案，化作终极 Fact 传递给下游
+        if should_end_research:
+            # 因为 research_complete_calls 是列表，所以 [0] 取出的是字典
+            final_conclusion = research_complete_calls[0]["args"].get("final_answer", "")
+            if final_conclusion:
+                from open_deep_research.state import Fact
+                facts.append(Fact(
+                    entity="Supervisor Final Conclusion",
+                    claim=f"The definitive final answer to the user query is: {final_conclusion}",
+                    source="Supervisor Internal Synthesis"
+                ))
+
+        return Command(goto=END, update={"structured_facts": facts})
+
 
     if no_tool_calls:
         # 计算历史消息中连续出现了多少次我们的 [SYSTEM ERROR] 拦截警告
@@ -1140,12 +1156,15 @@ async def assemble_report(state: AgentState, config: RunnableConfig) -> Command[
         content = draft_map.get(sec.section_title, f"## {sec.section_title}\n[该章节内容生成失败]")
         assembled_parts.append(content)
 
-    # 生成全局统一的参考文献列表
-    sources_section = ["\n\n### 参考文献 (Sources)"]
-    for i, fact in enumerate(structured_facts):
-        sources_section.append(f"- [{i + 1}] Source: {getattr(fact, 'source', 'Unknown')}")
+    if len(outline) == 1 and outline[0].section_title == "Final Answer":
+        full_report = "\n\n".join(assembled_parts)
+    else:
+        # 生成全局统一的参考文献列表
+        sources_section = ["\n\n### 参考文献 (Sources)"]
+        for i, fact in enumerate(structured_facts):
+            sources_section.append(f"- [{i + 1}] Source: {getattr(fact, 'source', 'Unknown')}")
 
-    full_report = "\n\n".join(assembled_parts) + "\n".join(sources_section)
+        full_report = "\n\n".join(assembled_parts) + "\n".join(sources_section)
 
     return Command(
         goto="report_verifier",
