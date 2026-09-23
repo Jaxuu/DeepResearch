@@ -80,6 +80,24 @@ async def test_advanced_tools():
                 await session.initialize()
                 print("✅ 握手成功！准备执行高级工具...")
 
+                # 1. 新增：测试 execute_python_code 代码沙盒
+                await call_with_timeout(
+                    session,
+                    "execute_python_code",
+                    arguments={
+                        "code": """
+                    import sys
+                    import math
+
+                    print("Hello from Python Sandbox!")
+                    print(f"Python Version: {sys.version_info.major}.{sys.version_info.minor}")
+                    result = math.factorial(10)
+                    print(f"Factorial of 10 is: {result}")
+                    """
+                    },
+                    timeout=120.0,
+                )
+
                 # 2.1 测试 Python 计算
                 await call_with_timeout(
                     session,

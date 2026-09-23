@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import os
 import re
@@ -5,9 +6,9 @@ import io
 import base64
 import tempfile
 import asyncio
+import textwrap
 from contextlib import redirect_stdout
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-
 import httpx
 
 from mcp.server.fastmcp import FastMCP
@@ -18,24 +19,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.document_loaders import PyPDFLoader
 from playwright.async_api import async_playwright
-
-
-def _trace(msg: str):
-    line = f"[TRACE-ADV] {msg}\n"
-    try:
-        sys.stderr.write(line)
-        sys.stderr.flush()
-    except Exception:
-        pass
-    try:
-        with open("D:/mcp_trace_adv.log", "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception:
-        pass
-
-
-_trace("========== advanced 子进程启动 ==========")
-_trace(f"OPENAI_API_KEY set? {bool(os.getenv('OPENAI_API_KEY'))}")
 
 mcp = FastMCP("AdvancedResearchTools")
 
@@ -71,8 +54,6 @@ async def calculate_with_python(data_context: str, calculation_goal: str) -> str
     """
     A quantitative analysis sandbox. Use this to perform complex math, statistics, or unit conversions.
     """
-    _trace(">>> calculate_with_python ENTER")
-
     model_name = os.getenv("SUPERVISOR_MODEL", "qwen-plus")
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_BASE_URL")
@@ -97,16 +78,13 @@ async def calculate_with_python(data_context: str, calculation_goal: str) -> str
 
     current_prompt = system_prompt
     for attempt in range(5):
-        _trace(f">>> attempt {attempt + 1}")
         try:
             response = await skill_model.ainvoke([HumanMessage(content=current_prompt)])
             code_match = re.search(r"```python\n(.*?)\n```", response.content, re.DOTALL)
             code = code_match.group(1) if code_match else response.content.replace("```python", "").replace("```", "")
 
-            _trace(f">>> code to exec: {code[:200]}")
-            _trace(">>> before exec")
+            code = textwrap.dedent(code).strip()
             output, err = await asyncio.to_thread(_safe_exec, code, 15.0)
-            _trace(f">>> after exec, err={err}")
             if err:
                 output = output + f"\nTraceback Exception: {err}"
 
@@ -117,10 +95,8 @@ async def calculate_with_python(data_context: str, calculation_goal: str) -> str
                 current_prompt += "\n\nPrevious attempt ran successfully but printed nothing. You MUST use print()."
                 continue
 
-            _trace(">>> calculate success")
             return f"[✅ Calculation Success]\nResult details:\n{output.strip()}"
         except Exception as e:
-            _trace(f"!!! attempt {attempt + 1} error: {e!r}")
             current_prompt += f"\n\nSystem error occurred: {str(e)}\nFix the issue and rewrite."
 
     return "[❌ Tool Failed] Unable to compute the requested data."
@@ -132,13 +108,10 @@ async def extract_from_long_document(url: str, extraction_query: str) -> str:
     Extract specific information from extremely long documents (PDFs, massive HTML pages).
     Pass the URL and a highly optimized, keyword-rich extraction query.
     """
-    _trace(f">>> extract_from_long_document ENTER: {url}")
-
     full_content = ""
 
     if url.lower().endswith(".pdf") or "pdf" in url.lower():
         try:
-            # ✅ 改用 httpx 同步接口（requests 也能用，但统一用 httpx 便于管理）
             with httpx.Client(timeout=30.0, follow_redirects=True) as client:
                 response = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
                 response.raise_for_status()
@@ -151,7 +124,6 @@ async def extract_from_long_document(url: str, extraction_query: str) -> str:
             full_content = "\n\n".join([p.page_content for p in loader.load()])
             os.remove(temp_pdf_path)
         except Exception as e:
-            _trace(f"!!! PDF extraction failed: {e!r}")
             return f"[❌ Tool Failed] Native PDF extraction failed: {str(e)}"
     else:
         jina_url = f"https://r.jina.ai/{url}"
@@ -205,18 +177,14 @@ async def analyze_webpage_visual_layout(url: str, specific_question: str) -> str
     """
     Analyze the physical layout, colors, or typography of a webpage visually using a headless browser and Vision LLM.
     """
-    _trace(f">>> analyze_webpage_visual_layout ENTER: {url}")
-
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            # ✅ 加超时，防止 networkidle 永远不返回
             await page.goto(url, wait_until="networkidle", timeout=30000)
             screenshot_bytes = await page.screenshot(full_page=True)
             await browser.close()
     except Exception as e:
-        _trace(f"!!! screenshot failed: {e!r}")
         return f"Failed to capture webpage: {str(e)}"
 
     base64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
@@ -241,13 +209,50 @@ async def analyze_webpage_visual_layout(url: str, specific_question: str) -> str
     return f"Visual Analysis Result for {url}:\n{response.content}"
 
 
-if __name__ == "__main__":
-    _trace(">>> advanced starting mcp.run(transport='stdio')")
-    try:
-        mcp.run(transport="stdio")
-    except BaseException as e:
-        _trace(f"!!! mcp.run CRASHED: {type(e).__name__}: {e}")
-        import traceback
+@mcp.tool()
+async def execute_python_code(code: str) -> str:
+    """
+    Executes a given string of Python code in a local sandbox environment.
+    Use this tool to parse files (Excel, Word, PPTX), perform complex math,
+    or run algorithms. Provide the full, runnable Python script.
+    Use absolute file paths if reading local files.
+    Always print() the final result so it can be captured in stdout.
+    """
+    # 去掉代码的统一缩进，防止模型生成的代码带缩进导致 IndentationError
+    code = textwrap.dedent(code).strip()
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as temp_script:
+        temp_script.write(code)
+        temp_script_path = temp_script.name
 
-        _trace(traceback.format_exc())
-        raise
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, temp_script_path],
+            text=True,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=os.environ.copy(),
+            cwd=os.getcwd(),
+        )
+
+        output = result.stdout
+        if result.stderr:
+            output += f"\n--- STDERR ---\n{result.stderr}"
+        if not output.strip():
+            output = "Code executed successfully but returned no output. Did you forget to print()?"
+
+        return output
+
+    except subprocess.TimeoutExpired:
+        return "Error: Code execution timed out after 60 seconds."
+    except Exception as e:
+        return f"Execution failed: {str(e)}"
+    finally:
+        if os.path.exists(temp_script_path):
+            os.remove(temp_script_path)
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")

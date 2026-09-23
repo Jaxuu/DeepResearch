@@ -628,7 +628,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     active_tools = []
 
     for tool_obj in tools:
-        tool_name = tool_obj.name if hasattr(tool_obj, "name") else tool_obj.get("name", "web_search")
+        tool_name = tool_obj.name if hasattr(tool_obj, "name") else tool_obj.get("name")
         if tool_name in RESEARCH_TOOL_NAMES or tool_name in allowed_tool_names:
             active_tools.append(tool_obj)
 
@@ -757,7 +757,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
 
         print(f"\n[拦截] Researcher 未调用工具，强制打回 (第 {error_count + 1}/3 次)。")
         warning_msg = HumanMessage(
-            content="[SYSTEM ERROR] You MUST call a tool (e.g., `web_search`, a skill, or `ResearchComplete`). Do not output plain conversational text.")
+            content="[SYSTEM ERROR] You MUST call a tool. Do not output plain conversational text.")
         return Command(goto="researcher", update={"researcher_messages": [warning_msg]})
 
     # 第2步：处理工具调用

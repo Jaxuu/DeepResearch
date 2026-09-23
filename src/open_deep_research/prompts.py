@@ -26,16 +26,19 @@ If you DO NOT need to ask a question (need_clarification=false), follow these gu
 """
 
 task_routing_prompt = """
-You are an expert intent classifier for an autonomous agent. 
-Analyze the user's prompt and determine if it requires external web research or if it is a pure logic, math, or reasoning puzzle.
+You are an expert intent classifier for an autonomous agent graph. 
+Analyze the user's prompt and determine the execution path.
 
 <Messages>
 {messages}
 </Messages>
 
 Classification Rules:
-1. "research": The query asks for real-world facts, news, specific product details, historical events, or any information you must look up.
-2. "direct_answer": The query is a riddle, a probability question, a math problem, or asks to write code based on logic. It does not require searching the web.
+1. "research": Choose this if the query requires ANY of the following:
+   - External web research / fact-checking.
+   - Analyzing local files (Excel, Word, PPTX, CSV, datasets, images, audio).
+   - Executing code, solving grid/maze/spatial puzzles, or heavy data/math calculation that requires tools.
+2. "direct_answer": Choose this ONLY if the query is a simple text-based riddle, a basic conversational question, or general knowledge that can be answered purely through text reasoning without any local files, attachments, or tool execution.
 """
 
 transform_messages_into_research_topic_prompt = """

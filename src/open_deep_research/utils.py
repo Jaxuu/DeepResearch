@@ -220,7 +220,7 @@ def _make_langchain_tool_from_session(server_name: str, tool_def):
 
 
 async def _get_stdio_tools():
-    """从两个长连接 session 拉取工具列表。"""
+    """从长连接 session 中拉取工具列表。"""
     await _ensure_stdio_sessions()
     tools = []
     for server_name, info in _stdio_sessions.items():
@@ -318,6 +318,7 @@ ALLOWED_MCP_TOOLS = {
     "calculate_with_python",       # Python 计算
     "extract_from_long_document",  # 从长文档中提取信息
     "analyze_webpage_visual_layout",  # 分析网页视觉布局
+    "execute_python_code",           # 执行 Python 代码
 }
 
 # 2. 本地原生工具注册表 (Native Tools Registry)
