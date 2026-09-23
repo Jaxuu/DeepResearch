@@ -37,13 +37,13 @@ class ConductResearch(BaseModel):
     research_topic: str = Field(
         description="待调研的具体子主题。必须是单一主题，且需包含高度详尽的描述（至少一段话）。",
     )
-    # 技能清单，要求依赖 search_tools_catalog 的结果
+    # 工具分配字段
     required_tools: List[str] = Field(
-        description="The specific tools this agent should have access to. For standard web search, use ['web_search', 'fetch_webpage']. For specialized tasks (e.g., RAG queries, DB queries, Git repos, internal docs), you MUST use the exact tool names returned by `search_tools_catalog`.",
+        description="The specific tools this agent should have access to.",
     )
     # 技能分配字段
     required_skills: List[str] = Field(
-        description="The specific native skills assigned to this agent. You MUST NOT guess skill names. You MUST query `search_tools_catalog` to discover available skills and use the exact names returned.",
+        description="The specific native skills assigned to this agent.",
     )
 
 class ResearchComplete(BaseModel):

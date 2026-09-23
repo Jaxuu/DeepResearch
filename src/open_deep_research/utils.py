@@ -1,130 +1,23 @@
 """Deep Research 智能体的实用工具与辅助函数。"""
-import base64
-
 import asyncio
-import json
-import logging
 import os
-import httpx
-import warnings
-import tempfile
-import requests
 import re
+import sys
+import httpx
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
+from pydantic import create_model
+from dotenv import load_dotenv
+from contextlib import AsyncExitStack
 
-import urllib.parse
-from tavily import AsyncTavilyClient
+from langchain_core.messages import AIMessage, HumanMessage, MessageLikeRepresentation
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool, StructuredTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
-from playwright.sync_api import sync_playwright
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    MessageLikeRepresentation
-)
-from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import (
-    BaseTool,
-    InjectedToolArg,
-    StructuredTool,
-    ToolException,
-    tool,
-)
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.retrievers import BM25Retriever
-from langchain_core.documents import Document
-from langchain.chat_models import init_chat_model
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_experimental.utilities import PythonREPL
-from langchain_community.document_loaders import PyPDFLoader
 
-from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.state import ResearchComplete
-
-##########################
-# Tavily 搜索工具组件
-##########################
-
-@tool(
-    description="""Search the web for news, facts, and public data. Returns titles, URLs, and concise snippets.
-    SEARCH STRATEGY 1 (Broad Recall): NEVER use overly long sentences or negative operators (like `-word`). Search for core positive keywords and filter manually.
-    SEARCH STRATEGY 2 (Site Operator): Use `site:` for specific domains/journals (e.g., `site:nature.com`).
-    SEARCH STRATEGY 3 (Anti-Contamination): Strictly AVOID AI benchmark datasets, GitHub issues, or LLM evaluation papers. Rely ONLY on primary sources."""
-)
-async def web_search(
-        queries: List[str],
-        max_results: Annotated[int, InjectedToolArg] = 5,
-        topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
-        config: RunnableConfig = None
-) -> str:
-    """仅检索网页元数据与摘要片段，不下载全文。"""
-    tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
-
-    search_tasks = [
-        tavily_client.search(
-            query,
-            max_results=max_results,
-            include_raw_content=False,  # 关闭全量下载
-            topic=topic
-        )
-        for query in queries
-    ]
-    search_results = await asyncio.gather(*search_tasks)
-
-    # 简单去重
-    unique_results = {}
-    for response in search_results:
-        for result in response['results']:
-            url = result['url']
-            if url not in unique_results:
-                unique_results[url] = result
-
-    if not unique_results:
-        return "No valid search results found."
-
-    formatted_output = "Search Results (Snippets only):\n\n"
-    for i, (url, res) in enumerate(unique_results.items()):
-        formatted_output += f"[{i + 1}] Title: {res.get('title', 'N/A')}\n"
-        formatted_output += f"    URL: {url}\n"
-        formatted_output += f"    Snippet: {res.get('content', '')}\n\n"
-
-    return formatted_output
-
-
-@tool(
-    description="""Fetch and parse the full text of a specific URL into clean Markdown. 
-    RULE: ONLY call this on 1-2 high-authority URLs when snippets lack depth (e.g., financial tables, detailed specs). NEVER fetch every URL."""
-)
-async def fetch_webpage(url: str) -> str:
-    """使用远端 Jina Reader 服务直接提取网页正文 Markdown。"""
-    jina_url = f"https://r.jina.ai/{url}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "X-Timeout": "15",  # 15秒超时设置
-        "X-Return-Format": "markdown"  # 明确要求标准 Markdown
-    }
-
-    # 若在环境变量中配置了 JINA_API_KEY，则自动携带；没有配置也能直接免密访问
-    jina_key = os.getenv("JINA_API_KEY")
-    if jina_key:
-        headers["Authorization"] = f"Bearer {jina_key}"
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            response = await client.get(jina_url, headers=headers)
-            if response.status_code == 200:
-                content = response.text
-                # 安全截断，防止目标网页过长（保留约 15000 字符，足够提取长篇专业数据）
-                if len(content) > 50000:
-                    content = content[:50000] + "\n\n[...正文超长，已安全截断...]"
-                return content
-            else:
-                return f"Failed to fetch content from {url}. Status code: {response.status_code}"
-    except Exception as e:
-        return f"Error reading URL {url}: {str(e)}"
-
 
 ##########################
 # 思考工具
@@ -157,540 +50,479 @@ def think_tool(reflection: str) -> str:
     """
     return f"Reflection recorded: {reflection}"
 
+
+@tool(
+    description="""Fetch and parse the full text of a specific URL into clean Markdown. 
+    RULE: ONLY call this on 1-2 high-authority URLs when snippets lack depth (e.g., financial tables, detailed specs). NEVER fetch every URL."""
+)
+async def fetch_webpage(url: str) -> str:
+    """使用远端 Jina Reader 服务直接提取网页正文 Markdown。"""
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "X-Timeout": "15",  # 15秒超时设置
+        "X-Return-Format": "markdown"  # 明确要求标准 Markdown
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            response = await client.get(jina_url, headers=headers)
+            if response.status_code == 200:
+                content = response.text
+                # 安全截断，防止目标网页过长
+                if len(content) > 50000:
+                    content = content[:50000] + "\n\n[...正文超长，已安全截断...]"
+                return content
+            else:
+                return f"Failed to fetch content from {url}. Status code: {response.status_code}"
+    except Exception as e:
+        return f"Error reading URL {url}: {str(e)}"
+
 ##########################
-# 基础工具组件
+# MCP 客户端管理
 ##########################
 
-async def get_search_tool(search_api: SearchAPI):
-    """根据指定的 API 提供商配置并返回搜索工具。
+# --- stdio server：手动长连接 ---
+_stdio_sessions = {}          # {server_name: {"session": ..., "exit_stack": ...}}
+_stdio_sessions_lock = asyncio.Lock()
 
-    参数:
-        search_api: 搜索 API 提供商（Anthropic、OpenAI、Tavily 或 None）
+# --- 远程 server（SSE / streamable_http）：继续用 MultiServerMCPClient ---
+_mcp_client = None
+_mcp_client_lock = asyncio.Lock()
 
-    返回:
-        指定提供商的已配置搜索工具对象列表
-    """
-    if search_api == SearchAPI.ANTHROPIC:
-        # 带使用次数限制的 Anthropic 原生网络搜索
-        return [{
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": 5
-        }]
+# --- 工具缓存 ---
+_cached_mcp_tools = None
+_mcp_tools_lock = asyncio.Lock()
 
-    elif search_api == SearchAPI.OPENAI:
-        # OpenAI 原生网络搜索预览功能
-        return [{"type": "web_search_preview"}]
+def _build_stdio_env() -> dict:
+    """构建传给 stdio 子进程的环境变量（白名单注入）。"""
+    env = os.environ.copy()
+    load_dotenv(override=True)
+    env["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
+    env["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL", "")
+    env["SUPERVISOR_MODEL"] = os.getenv("SUPERVISOR_MODEL", "qwen-plus")
+    env["VISUAL_MODEL"] = os.getenv("VISUAL_MODEL", "qwen-vl-plus")
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
-    elif search_api == SearchAPI.TAVILY:
-        # 配置带元数据的 Tavily 搜索工具
-        search_tool = web_search
-        search_tool.metadata = {
-            **(search_tool.metadata or {}),
-            "type": "search",
-            "name": "web_search"
-        }
-        return [search_tool]
+async def _start_stdio_session(name: str, script_path: str, env: dict):
+    """启动一个 stdio 子进程并建立长连接 session。"""
+    print(f"[MCP] 启动 stdio 子进程: {name}", file=sys.stderr, flush=True)
+    exit_stack = AsyncExitStack()
+    try:
+        read, write = await exit_stack.enter_async_context(
+            stdio_client(StdioServerParameters(
+                command=sys.executable,
+                args=[script_path],
+                env=env,
+            ))
+        )
+        session = await exit_stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        print(f"[MCP] {name} 握手成功", file=sys.stderr, flush=True)
+        _stdio_sessions[name] = {"session": session, "exit_stack": exit_stack}
+    except Exception as e:
+        print(f"[MCP] {name} 启动失败: {e!r}", file=sys.stderr, flush=True)
+        await exit_stack.aclose()
+        raise
 
-    elif search_api == SearchAPI.NONE:
-        # 未配置任何搜索功能
-        return []
+async def _ensure_stdio_sessions():
+    """确保两个 stdio 子进程都已启动（只启动一次）。"""
+    if _stdio_sessions:
+        return
+    async with _stdio_sessions_lock:
+        if _stdio_sessions:
+            return
+        env = _build_stdio_env()
+        await _start_stdio_session(
+            "basic_tools",
+            "D:/Project/llm-project/open_deep_research/mcp_servers/mcp_basic_tools.py",
+            env,
+        )
+        await _start_stdio_session(
+            "advanced_tools",
+            "D:/Project/llm-project/open_deep_research/mcp_servers/mcp_advanced_tools.py",
+            env,
+        )
 
-    # 未知搜索 API 类型的默认兜底处理
-    return []
+# JSON Schema 类型 → Python 类型
+_JSON_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
 
-async def get_all_tools(config: RunnableConfig):
-    """组装完整工具包，包含研究、搜索和 MCP 工具。
+def _json_schema_to_pydantic(schema: dict, model_name: str):
+    """把 MCP 的 JSON Schema 转成 Pydantic 模型类。"""
+    if not isinstance(schema, dict):
+        schema = {}
 
-    参数:
-        config: 指定搜索 API 和 MCP 设置的运行时配置
+    properties = schema.get("properties", {}) or {}
+    required = set(schema.get("required", []) or [])
 
-    返回:
-        用于研究操作的所有已配置且可用的工具列表
-    """
-    # 首先添加核心研究工具
-    tools = [tool(ResearchComplete), think_tool]
+    fields = {}
+    for prop_name, prop_schema in properties.items():
+        if not isinstance(prop_schema, dict):
+            prop_schema = {}
 
-    # 添加配置的搜索工具
-    configurable = Configuration.from_runnable_config(config)
-    search_api = SearchAPI(get_config_value(configurable.search_api))
+        json_type = prop_schema.get("type", "string")
+        # 处理 type 是 list 的情况（如 ["string", "null"]）
+        if isinstance(json_type, list):
+            json_type = next((t for t in json_type if t != "null"), "string")
 
-    # 若选择 Tavily，则挂载新改造的 web_search
-    if search_api == SearchAPI.TAVILY:
-        tools.append(web_search)
-        tools.append(fetch_webpage)
-    else:
-        search_tools = await get_search_tool(search_api)
-        tools.extend(search_tools)
+        py_type = _JSON_TYPE_MAP.get(json_type, Any)
 
+        if prop_name in required:
+            fields[prop_name] = (py_type, ...)      # 必填
+        else:
+            fields[prop_name] = (py_type, None)     # 可选
+
+    # 如果没有字段，生成一个空模型（避免 StructuredTool 报错）
+    if not fields:
+        fields["_dummy"] = (Optional[str], None)
+
+    return create_model(model_name, **fields)
+
+
+def _make_langchain_tool_from_session(server_name: str, tool_def):
+    """把一个 MCP tool 定义包装成 LangChain Tool（通过长连接 session 调用）。"""
+    tool_name = tool_def.name
+    description = tool_def.description or ""
+    input_schema = getattr(tool_def, "inputSchema", None) or {}
+
+    # 动态生成 Pydantic 模型
+    try:
+        args_model = _json_schema_to_pydantic(input_schema, f"{tool_name}_Args")
+    except Exception as e:
+        print(f"[MCP] {tool_name} schema 转换失败: {e!r}", file=sys.stderr, flush=True)
+        raise
+
+    async def _ainvoke(**kwargs):
+        # 去掉 _dummy
+        kwargs.pop("_dummy", None)
+        session = _stdio_sessions[server_name]["session"]
+        result = await session.call_tool(tool_name, arguments=kwargs)
+        texts = []
+        for block in result.content:
+            if getattr(block, "type", None) == "text":
+                texts.append(block.text)
+        return "\n".join(texts) if texts else str(result)
+
+    return StructuredTool(
+        name=tool_name,
+        description=description,
+        args_schema=args_model,
+        coroutine=_ainvoke,
+    )
+
+
+async def _get_stdio_tools():
+    """从两个长连接 session 拉取工具列表。"""
+    await _ensure_stdio_sessions()
+    tools = []
+    for server_name, info in _stdio_sessions.items():
+        listed = await info["session"].list_tools()
+        for t in listed.tools:
+            tools.append(_make_langchain_tool_from_session(server_name, t))
     return tools
 
-##########################
-# MCP 工具组件
-##########################
 
-# 模拟企业级架构中的“连接池单例”，保证跨越 Supervisor 和 Sub-agent 多个节点时，网络通道持久存活
-_mcp_client = None
+async def cleanup_mcp_sessions():
+    """程序退出时调用，关闭所有 stdio 长连接。"""
+    for name, info in list(_stdio_sessions.items()):
+        try:
+            await info["exit_stack"].aclose()
+            print(f"[MCP] {name} 已关闭", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+    _stdio_sessions.clear()
+
 
 async def get_or_create_mcp_client():
-    """获取或初始化全局 MCP 客户端单例"""
+    """获取或初始化全局 MCP 客户端单例（只负责远程 server）。"""
     global _mcp_client
-    if _mcp_client is None:
-        # 这里配置所有你需要接入的 MCP Server（无论内部还是第三方）
+    if _mcp_client is not None:
+        return _mcp_client
+    async with _mcp_client_lock:
+        if _mcp_client is not None:
+            return _mcp_client
+
+        load_dotenv(override=True)
+        # ⚠️ 这里只放远程 server。两个 stdio server 已经挪到长连接管理。
         mcp_config = {
-            "industrial_rag": {"transport": "sse", "url": "http://127.0.0.1:8080/sse"},
-            "sqlite_db": {"transport": "sse", "url": "http://127.0.0.1:8001/sse"}
+            # "industrial_rag": {
+            #     "transport": "sse",
+            #     "url": "http://127.0.0.1:8080/sse"
+            # },
+            # "sqlite_db": {
+            #     "transport": "sse",
+            #     "url": "http://127.0.0.1:8001/sse"
+            # },
+            "tavily_remote_search": {
+                "transport": "streamable_http",
+                "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={os.getenv('TAVILY_API_KEY', '')}"
+            }
         }
         _mcp_client = MultiServerMCPClient(mcp_config)
     return _mcp_client
 
+
+async def get_mcp_tools_cached():
+    """获取 MCP 工具（带缓存，只拉一次）——合并 stdio 长连接工具和远程工具。"""
+    global _cached_mcp_tools
+    if _cached_mcp_tools is not None:
+        return _cached_mcp_tools
+    async with _mcp_tools_lock:
+        if _cached_mcp_tools is not None:
+            return _cached_mcp_tools
+
+        all_tools = []
+
+        # 1. stdio 长连接工具
+        try:
+            stdio_tools = await _get_stdio_tools()
+            print(f"[MCP] stdio 工具加载完成: {len(stdio_tools)} 个", file=sys.stderr, flush=True)
+            all_tools.extend(stdio_tools)
+        except Exception as e:
+            print(f"[MCP] stdio 工具加载失败: {e!r}", file=sys.stderr, flush=True)
+
+        # 2. 远程 MCP 工具
+        try:
+            client = await get_or_create_mcp_client()
+            print("[MCP] 拉取远程工具...", file=sys.stderr, flush=True)
+            remote_tools = await asyncio.wait_for(client.get_tools(), timeout=60.0)
+            print(f"[MCP] 远程工具加载完成: {len(remote_tools)} 个", file=sys.stderr, flush=True)
+            all_tools.extend(remote_tools)
+        except Exception as e:
+            print(f"[MCP] 远程工具加载失败: {e!r}", file=sys.stderr, flush=True)
+
+        _cached_mcp_tools = all_tools
+    return _cached_mcp_tools
+
+
+
+
 ##########################
-# Skill工具组件
+# 动态感知Tools
 ##########################
 
-# 初始化 REPL 单例
-_python_repl = PythonREPL()
-
-@tool(
-    description="""A highly capable quantitative analysis skill. 
-    TRIGGER: Use this ANYTIME financial processing, math, stats, counts, or unit conversions are required.
-    RULE: You are FORBIDDEN from performing manual math, currency conversions, or statistical calculations yourself.
-    WORKFLOW: Gather raw data first -> Pass raw data as 'data_context' and calculation goal as 'calculation_goal' -> Wait for the Python sandbox output. Your research task is NOT COMPLETE until you receive the final numerical output."""
-)
-async def quantitative_analysis_skill(data_context: str, calculation_goal: str, config: RunnableConfig = None) -> str:
-    """
-    Skill: 动态量化分析沙箱。
-    向内部大模型隐藏复杂的代码生成与执行逻辑，对外仅暴露自然语言接口。
-
-    Args:
-        data_context: 包含所有计算所需原始数值的文本片段（如财报段落、表格摘录）。
-        calculation_goal: 明确的计算指令（例如："Calculate the profit margin and convert it to a percentage"）。
-    """
-    # 动态获取配置中的模型资源，为 Skill 内部的“隐形工头”提供算力
-    from open_deep_research.configuration import Configuration
-    from open_deep_research.deep_researcher import configurable_model
-
-    configurable = Configuration.from_runnable_config(config)
-    skill_model = configurable_model.with_config({
-        "model": configurable.logical_reasoning_model,  # 使用速度快、成本低的小模型写代码即可
-        "max_tokens": 1000,
-        "api_key": get_api_key_for_model(configurable.logical_reasoning_model, config),
-    })
-
-    system_prompt = f"""You are a Python Data Analyst. Your job is to achieve the calculation goal based on the data.
-                        Data Context:
-                        {data_context}
-                        
-                        Goal: {calculation_goal}
-                        
-                        Write a python script to compute this. Print the exact final numerical result clearly.
-                        Return ONLY valid python code wrapped in ```python```. Do not explain."""
-
-    max_retries = 5
-    current_prompt = system_prompt
-
-    # SOP 闭环：生成 -> 执行 -> 校验验 -> 自愈
-    for attempt in range(max_retries):
-        try:
-            # 1. 内部生成代码
-            response = await skill_model.ainvoke([HumanMessage(content=current_prompt)])
-
-            # 2. 提取代码块
-            code_match = re.search(r"```python\n(.*?)\n```", response.content, re.DOTALL)
-            code = code_match.group(1) if code_match else response.content.replace("```python", "").replace("```", "")
-
-            # 3. 沙箱执行
-            output = _python_repl.run(code)
-
-            # 4. 结果校验
-            if "Error" in output or "Exception" in output or "Traceback" in output:
-                # 触发自愈逻辑，将错误喂回给模型
-                current_prompt += f"\n\nPrevious attempt failed with error:\n{output}\nPlease fix the code and try again."
-                continue
-
-            if not output.strip():
-                current_prompt += f"\n\nPrevious attempt ran successfully but printed nothing. You MUST use print() to output the final result."
-                continue
-
-            # 成功则直接将结果抛给外层的 Researcher
-            return f"[✅ Skill Verified Calculation] Successfully executed quantitative analysis.\nResult details:\n{output.strip()}"
-
-        except Exception as e:
-            current_prompt += f"\n\nSystem error occurred: {str(e)}\nFix the issue and rewrite."
-
-    return "[❌ Skill Failed] Unable to compute the requested data after multiple attempts. You may need to rely on the raw text."
-
-
-@tool(
-    description="""A Sub-RAG skill for deep mining of EXTREMELY LONG documents (PDFs, massive HTML Changelogs).
-    TRIGGER: Use this when a source is an extremely long report where 'fetch_webpage' is insufficient due to length limits.
-    WORKFLOW & RULE: Discover the document URL via `web_search` -> Pass the URL and your query to this skill. 
-    CRITICAL QUERY RULE: The backend uses lexical keyword matching (BM25). DO NOT pass abstract conversational questions (e.g., "what other predictor base command..."). You MUST pass a highly optimized, keyword-rich query containing synonyms, base class names, and wildcards (e.g., "bug fix BaseEstimator BaseLabelPropagation base command predictor")."""
-)
-async def long_doc_mining_skill(url: str, extraction_query: str, config: RunnableConfig = None) -> str:
-    """
-    长文/PDF 深度挖掘技能。
-    突破 50000 字符限制，使用内存级 BM25 检索目标块，交由小模型精准提纯。
-    升级：支持原生 PDF 物理穿透
-    """
-    # 1. 全量获取文档 (无字符截断)
-    full_content = ""
-
-    # 如果是 PDF 链接，直接下载并使用 PyPDFLoader 读取，绕过第三方解析的超时风险
-    if url.lower().endswith(".pdf") or "pdf" in url.lower():
-        print(f"\n[📄 PDF 穿透] 侦测到 PDF 链接，启动原生内存解析: {url}")
-        try:
-            # 使用同步 requests 下载文件，因为文件写入是同步操作
-            response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            response.raise_for_status()
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                temp_file.write(response.content)
-                temp_pdf_path = temp_file.name
-
-            loader = PyPDFLoader(temp_pdf_path)
-            pages = loader.load()
-            full_content = "\n\n".join([p.page_content for p in pages])
-            os.remove(temp_pdf_path)  # 读完就删，不留垃圾
-        except Exception as e:
-            return f"[❌ Skill Failed] Native PDF extraction failed for {url}: {str(e)}"
-
-    else:
-        # 非 PDF 页面，依然走 Jina Reader
-        jina_url = f"https://r.jina.ai/{url}"
-        headers = {"User-Agent": "Mozilla/5.0", "X-Timeout": "30"}
-        jina_key = os.getenv("JINA_API_KEY")
-        if jina_key: headers["Authorization"] = f"Bearer {jina_key}"
-
-        try:
-            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-                response = await client.get(jina_url, headers=headers)
-                if response.status_code != 200:
-                    return f"[❌ Skill Failed] Unable to fetch {url}. Status: {response.status_code}"
-                full_content = response.text
-        except Exception as e:
-            return f"[❌ Skill Failed] Network error fetching {url}: {str(e)}"
-
-    # 2. 内存级快速文本切片
-    splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=300)
-    chunks = splitter.split_text(full_content)
-
-    # 如果文档并不长，无需 RAG，直接取全部
-    if len(chunks) <= 3:
-        context = full_content
-    else:
-        # 3. 本地 BM25 召回最相关的 Top-5 块 (不耗费任何 API Token)
-        docs = [Document(page_content=chunk) for chunk in chunks]
-        retriever = BM25Retriever.from_documents(docs)
-        retriever.k = 10
-        top_docs = retriever.invoke(extraction_query)
-        context = "\n\n---\n\n".join([d.page_content for d in top_docs])
-
-    # 4. 唤醒便宜的小模型执行阅读理解与提纯
-    from open_deep_research.configuration import Configuration
-    configurable = Configuration.from_runnable_config(config)
-
-    # 就地初始化模型，防止与 deep_researcher 产生循环引用
-    skill_model = init_chat_model(
-        model=configurable.logical_reasoning_model,
-        api_key=get_api_key_for_model(configurable.logical_reasoning_model, config),
-        max_tokens=1500
-    )
-
-    prompt = f"""You are an elite Data Extraction Analyst.
-                    <Source URL>
-                    {url}
-                    </Source URL>
-                    
-                    <Your Task>
-                    Extract precise information to answer this query: {extraction_query}
-                    </Your Task>
-                    
-                    <Retrieved Context>
-                    {context}
-                    </Retrieved Context>
-                    
-                    <Instructions>
-                    1. Synthesize the answer ONLY using the <Retrieved Context>. Do not hallucinate.
-                    2. If the context does not contain the answer, explicitly state: "The requested information could not be found in the document."
-                    3. Include specific numbers, dates, and metrics if present.
-                    </Instructions>
-                """
-
-    try:
-        res = await skill_model.ainvoke([HumanMessage(content=prompt)])
-        return f"[✅ Long-Doc Mining Success]\nExtracted from {url}:\n{res.content}"
-    except Exception as e:
-        return f"[❌ Skill Failed] LLM extraction error: {str(e)}"
-
-@tool(
-    description="""A specialized Data Visualization skill to generate industrial-grade chart images via API.
-    TRIGGER: Use this ANYTIME you need to create charts, graphs, or visual data representations.
-    RULE: Freehand ASCII/Markdown painting is strictly forbidden. 
-    WARNING: Keep your 'visualization_goal' EXTREMELY SIMPLE (e.g., "Compare 2023 revenue between Apple and Microsoft"). DO NOT ask for custom colors, dual Y-axes, or matplotlib styles.
-    WORKFLOW: Gather all required numerical data -> Pass the raw data and your simple chart design goal -> Wait for the generated Markdown image link (e.g., `![chart](url)`)."""
-)
-async def data_visualization_skill(data_context: str, visualization_goal: str, config: RunnableConfig = None) -> str:
-    """
-    调用外部工业级图表 QuickChart API 生成真实图片链接
-    """
-    from open_deep_research.configuration import Configuration
-    from langchain.chat_models import init_chat_model
-
-    configurable = Configuration.from_runnable_config(config)
-    skill_model = init_chat_model(
-        model=configurable.logical_reasoning_model,
-        temperature=0.1,
-        max_tokens=1500
-    )
-
-    # 工业界做法：让模型只输出标准的 Chart.js JSON 配置，这种 JSON 模型极难出错
-    prompt = f"""You are a Data Visualization API expert. Create a Chart.js JSON configuration for the following goal.
-                <Data Context>
-                {data_context}
-                </Data Context>
-                <Goal>
-                {visualization_goal}
-                </Goal>
-                
-                <Strict Rules>
-                1. Output ONLY a valid JSON object representing a Chart.js configuration.
-                2. Choose the most appropriate chart type ("bar", "line", "pie", "doughnut", "radar", "scatter") based on the <Goal>.
-                3. NO markdown formatting, NO backticks, NO explanations.
-                4. Example of valid output format (using bar as an example):
-                {{
-                  "type": "bar",
-                  "data": {{
-                    "labels": ["Apple", "Microsoft"],
-                    "datasets": [{{ "label": "Revenue", "data": [383, 211] }}]
-                  }}
-                }}
-                </Strict Rules>
-            """
-
-    for attempt in range(3):
-        try:
-            res = await skill_model.ainvoke([HumanMessage(content=prompt)])
-            raw_content = res.content
-
-            # 1. 兼容 LangChain 内容块列表解析 (处理 [{"type":"text", "text":"..."}] 的情况)
-            chart_text = ""
-            if isinstance(raw_content, list):
-                for block in raw_content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        chart_text += block.get("text", "")
-            else:
-                chart_text = str(raw_content)
-
-            # 2. 精准提取 JSON (寻找第一对 { 和最后一对 } 之间的内容，过滤大模型的废话)
-            match = re.search(r'(\{.*\})', chart_text, re.DOTALL)
-            if not match:
-                raise ValueError("No JSON object found in the model response.")
-            clean_json_str = match.group(1)
-
-            # 验证 JSON 是否合法
-            chart_json = json.loads(clean_json_str)
-
-            # 3. 工业级做法：POST 到 QuickChart 获取短链接
-            req_data = json.dumps({"chart": chart_json}).encode('utf-8')
-            req = urllib.request.Request(
-                "https://quickchart.io/chart/create",
-                data=req_data,
-                headers={'Content-Type': 'application/json'}
-            )
-
-            with urllib.request.urlopen(req) as response:
-                res_body = json.loads(response.read().decode('utf-8'))
-                if res_body.get("success"):
-                    short_url = res_body.get("url")
-                    # 返回干净清爽的 Markdown 图片链接
-                    return f"[✅ Visualization Generated]\n![Data_Visualization_Chart]({short_url})"
-                else:
-                    raise Exception("QuickChart API failed to generate short URL.")
-
-        except Exception as e:
-            if attempt == 2:
-                return f"[❌ Skill Failed] {str(e)}"
-            prompt += "\nError: Output must be pure JSON."
-
-    return "[❌ Skill Failed]"
-
-
-
-
-
-@tool
-def visual_layout_analysis_skill(url: str, specific_question: str) -> str:
-    """
-    A visual analysis skill. Use this to analyze the physical layout, colors, or typography of a webpage.
-    Args:
-        url: The webpage URL to analyze.
-        specific_question: What exactly to look for (e.g., "Which stanza has indented lines?").
-    """
-    # 1. 使用 Playwright 启动无头浏览器并截图
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="networkidle")
-            screenshot_bytes = page.screenshot(full_page=True)
-            browser.close()
-    except Exception as e:
-        return f"Failed to capture webpage: {str(e)}"
-
-    # 2. 将截图转换为 Base64
-    base64_image = base64.b64encode(screenshot_bytes).decode('utf-8')
-
-    # 3. 调用阿里云百炼的 Qwen-VL 模型看图
-    # 注意：需配置百炼的 BASE_URL 和 API_KEY
-    vision_llm = ChatOpenAI(
-        model=os.getenv("VISUAL_MODEL"),
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        api_key=os.getenv("OPENAI_API_KEY")
-    )
-
-    message = HumanMessage(
-        content=[
-            {"type": "text",
-             "text": f"You are a visual layout expert. Analyze this webpage screenshot and answer: {specific_question}. Pay strict attention to CSS styling, indentations, and spatial arrangement."},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-            }
-        ]
-    )
-
-    # 4. 获取视觉模型的文本描述
-    response = vision_llm.invoke([message])
-
-    # 5. 将文本描述返回给主流程的文本 Agent
-    return f"Visual Analysis Result for {url}:\n{response.content}"
-
-# 在这里注册所有可用的复合技能
-AVAILABLE_SKILLS = {
-    "quantitative_analysis_skill": quantitative_analysis_skill,
-    "long_doc_mining_skill": long_doc_mining_skill,
-    "data_visualization_skill": data_visualization_skill,
-    "visual_layout_analysis_skill": visual_layout_analysis_skill
+# 1. MCP 远程工具白名单
+ALLOWED_MCP_TOOLS = {
+    "tavily_search",               # Tavily 提供的标准搜索
+    "search_equipment_knowledge",  # 你的 RAG 检索
+    "query_erp_database",          # 你的 ERP 查询
+    "generate_chart_image",        # 生成图表图片
+    "calculate_with_python",       # Python 计算
+    "extract_from_long_document",  # 从长文档中提取信息
+    "analyze_webpage_visual_layout",  # 分析网页视觉布局
 }
 
-def get_active_skills(assigned_skill_names: List[str]) -> List[Any]:
-    """
-    根据状态中传入的技能名称列表，动态映射并返回对应的技能实体函数。
-    """
-    active_skills = []
-    if not assigned_skill_names:
-        return active_skills
+# 2. 本地原生工具注册表 (Native Tools Registry)
+NATIVE_TOOLS = [
+    fetch_webpage
+]
 
-    for skill_name in assigned_skill_names:
-        skill_func = AVAILABLE_SKILLS.get(skill_name)
-        if skill_func:
-            active_skills.append(skill_func)
-        else:
-            print(f"\n[⚠️ 技能告警] 未找到名为 '{skill_name}' 的技能配置，跳过挂载。")
+RESEARCH_TOOLS = [
+    think_tool,
+    tool(ResearchComplete)
+]
+def _tool_name(t):
+    return getattr(t, "name", getattr(t, "__name__", str(t)))
+RESEARCH_TOOL_NAMES = {_tool_name(t) for t in RESEARCH_TOOLS}
 
-    return active_skills
 
-##########################
-# 动态感知工具和技能组件
-##########################
+async def get_all_tools(config: RunnableConfig):
+    """主程序拉取可用工具的唯一入口"""
+    tools = []
 
-@tool(
-    description="Search the Unified Tool Registry for both native system skills and external MCP integrations. Use this when you need specialized processing (e.g., charts, complex math, long documents, databases). Pass a natural language query describing the capability you need.")
-async def search_tools_catalog(query: str, config: RunnableConfig = None) -> str:
-    """动态工具与技能发现。向 Supervisor 统一暴露原生技能与 MCP 集成。"""
-    catalog_info = "Available Capabilities in Registry:\n\n"
+    # 1. 挂载研究控制工具
+    tools.extend(RESEARCH_TOOLS)
 
-    # 1. 挂载原生系统技能 (Native Skills)
-    catalog_info += "--- [System Native Skills] ---\n"
-    # AVAILABLE_SKILLS 是 utils.py 中已经存在的字典
-    for skill_name, skill_func in AVAILABLE_SKILLS.items():
-        catalog_info += f"- Skill Name: `{skill_name}`\n  Description: {skill_func.description}\n\n"
+    # 2. 挂载本地原生研究工具
+    tools.extend(NATIVE_TOOLS)
 
-    # 2. 挂载外部扩展工具 (MCP Integrations)
-    catalog_info += "--- [External MCP Integrations] ---\n"
+    # 3. 动态拉取并过滤远端 MCP 工具
     try:
-        client = await get_or_create_mcp_client()
-        available_tools = await client.get_tools()
-        if available_tools:
-            for t in available_tools:
+        mcp_tools = await get_mcp_tools_cached()
+        # 白名单物理拦截，剔除所有未授权的工具
+        filtered_mcp_tools = [t for t in mcp_tools if t.name in ALLOWED_MCP_TOOLS]
+        tools.extend(filtered_mcp_tools)
+    except Exception as e:
+        # 将 ExceptionGroup 里的真实子异常剥离出来打印
+        print(f"\n[⚠️ MCP 告警] 获取扩展工具失败: {str(e)}")
+        if hasattr(e, 'exceptions'):
+            for sub_e in e.exceptions:
+                print(f"   -> 具体崩溃原因: {repr(sub_e)}")
+    return tools
+
+async def get_tool_catalog_for_supervisor() -> str:
+    """动态工具发现。生成系统和远程 MCP 工具的说明字符串，供直接注入提示词。"""
+    catalog_info = "Available Capabilities in System & Remote MCP Registry:\n\n"
+
+    # 1：加载本地原生能力
+    for t in NATIVE_TOOLS:
+        catalog_info += f"- Tool Name: `{t.name}`\n  Description: {t.description}\n\n"
+
+    # 2：加载远程 MCP 能力
+    try:
+        available_tools = await get_mcp_tools_cached()
+
+        # 通过白名单过滤工具名录
+        filtered_tools = [t for t in available_tools if t.name in ALLOWED_MCP_TOOLS]
+        if filtered_tools:
+            for t in filtered_tools:
                 catalog_info += f"- Tool Name: `{t.name}`\n  Description: {t.description}\n\n"
         else:
             catalog_info += "(No MCP integrations currently active)\n\n"
     except Exception as e:
         catalog_info += f"(Failed to load MCP integrations: {str(e)})\n\n"
 
-        # 手把手教大模型怎么填 JSON
-        catalog_info += "=" * 40 + "\n"
-        catalog_info += "🚨 CRITICAL INSTRUCTION FOR DELEGATION 🚨\n"
-        catalog_info += "When you call `ConductResearch`, you MUST explicitly inject the exact names above into your JSON arguments.\n"
-        catalog_info += "Example JSON structure:\n"
-        catalog_info += "{\n"
-        catalog_info += '  "research_topic": "Find X...",\n'
-        catalog_info += '  "required_tools": ["web_search", "fetch_webpage", "your_mcp_tool_here"],\n'
-        catalog_info += '  "required_skills": ["long_doc_mining_skill"]\n'
-        catalog_info += "}\n"
-        catalog_info += "If you omit this, your sub-agent will fail to process complex tasks!"
-
-        return catalog_info
+    return catalog_info
 
 ##########################
-# 模型供应商原生网络搜索组件
+# 动态读取Skills
 ##########################
+"""
+Agent Skill 管理模块。
+负责从文件系统中加载 Markdown 格式的 SOP 操作手册，并向大模型注入上下文。
+"""
+def _find_skills_dir() -> str:
+    """从当前文件向上查找，定位项目根目录下的 skills 文件夹。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        candidate = os.path.join(here, "skills")
+        if os.path.isdir(candidate):
+            return candidate
+        here = os.path.dirname(here)
+    # 兜底：按原相对路径猜测
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
 
-def anthropic_websearch_called(response):
-    """检测响应中是否调用了 Anthropic 的原生网络搜索。
+SKILLS_DIR = _find_skills_dir()
 
-    参数:
-        response: 来自 Anthropic API 的响应对象
-
-    返回:
-        若调用了网络搜索返回 True，否则返回 False
+def _load_all_skills() -> Dict[str, str]:
     """
-    try:
-        # 遍历解析响应元数据结构
-        usage = response.response_metadata.get("usage")
-        if not usage:
-            return False
-
-        # 检查服务端工具使用信息
-        server_tool_use = usage.get("server_tool_use")
-        if not server_tool_use:
-            return False
-
-        # 查询网络搜索请求计数
-        web_search_requests = server_tool_use.get("web_search_requests")
-        if web_search_requests is None:
-            return False
-
-        # 若发起了任何网络搜索请求则返回 True
-        return web_search_requests > 0
-
-    except (AttributeError, TypeError):
-        # 处理响应结构不符合预期的情况
-        return False
-
-def openai_websearch_called(response):
-    """检测响应中是否使用了 OpenAI 的网络搜索功能。
-
-    参数:
-        response: 来自 OpenAI API 的响应对象
-
-    返回:
-        若调用了网络搜索返回 True，否则返回 False
+    读取 skills 目录下每个子文件夹中的 SKILL.md。
+    返回 {skill_id: 完整文件内容}，skill_id 取文件夹名。
     """
-    # 检查响应元数据中的工具输出
-    tool_outputs = response.additional_kwargs.get("tool_outputs")
-    if not tool_outputs:
-        return False
+    skills: Dict[str, str] = {}
+    if not os.path.exists(SKILLS_DIR):
+        return skills
 
-    # 检查工具输出中是否存在网络搜索调用
-    for tool_output in tool_outputs:
-        if tool_output.get("type") == "web_search_call":
-            return True
+    for entry in os.listdir(SKILLS_DIR):
+        skill_dir = os.path.join(SKILLS_DIR, entry)
+        skill_file = os.path.join(skill_dir, "SKILL.md")
+        if os.path.isdir(skill_dir) and os.path.exists(skill_file):
+            with open(skill_file, "r", encoding="utf-8") as f:
+                skills[entry] = f.read()
+    return skills
 
-    return False
 
+def _parse_frontmatter(content: str) -> Dict[str, str]:
+    """
+    轻量解析 SKILL.md 顶部的 YAML frontmatter、真实的 H1 标题和依赖的底层工具。
+    只提取 name / description / title / tools，不引入 pyyaml 依赖。
+    """
+    meta: Dict[str, str] = {}
+
+    # 1. 提取 YAML frontmatter (提取 name 和 description)
+    match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+    if match:
+        current_key = None
+        buffer: List[str] = []
+        for line in match.group(1).split("\n"):
+            kv = re.match(r'^([A-Za-z0-9_-]+)\s*:\s*(.*)$', line)
+            if kv:
+                if current_key is not None:
+                    meta[current_key] = " ".join(buffer).strip()
+                current_key = kv.group(1).strip()
+                buffer = [kv.group(2).strip()]
+            elif current_key is not None:
+                buffer.append(line.strip())
+        if current_key is not None:
+            meta[current_key] = " ".join(buffer).strip()
+
+        # 去掉包裹引号
+        for k, v in meta.items():
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                meta[k] = v[1:-1]
+
+    # 2. 提取真正的 Markdown 标题 (匹配第一个 # 开头的行)
+    h1_match = re.search(r'^#\s+(.*?)$', content, re.MULTILINE)
+    if h1_match:
+        meta['title'] = h1_match.group(1).strip()
+
+    # 3. 精准提取 "依赖的底层工具" 内容 (提取到下一个 ## 标题为止)
+    tools_match = re.search(r'##\s*依赖的底层工具.*?\n(.*?)(?=\n##\s|$)', content, re.DOTALL | re.IGNORECASE)
+    if tools_match:
+        meta['required_tools_text'] = tools_match.group(1).strip()
+    else:
+        meta['required_tools_text'] = "None explicitly listed."
+
+    return meta
+
+
+def get_skill_catalog_for_supervisor() -> str:
+    """
+    为 Supervisor 生成技能目录 (Catalog)。
+    从 frontmatter 和 H1 提取信息，并将强制绑定的底层工具暴露给主管。
+    """
+    skills = _load_all_skills()
+    if not skills:
+        return "No advanced skills available."
+
+    catalog = "Available Standard Operating Procedures (Skills):\n\n"
+
+    for skill_id, content in skills.items():
+        meta = _parse_frontmatter(content)
+
+        # 优先使用解析出的 H1 标题，如果没有则降级使用 name 或 skill_id
+        real_title = meta.get("title", meta.get("name", skill_id))
+        purpose = meta.get("description", "No description provided.")
+        req_tools = meta.get("required_tools_text", "")
+
+        catalog += f"- **Skill ID**: `{skill_id}`\n"
+        catalog += f"  - **Title**: {real_title}\n"
+        catalog += f"  - **Description**: {purpose}\n"
+
+        # 将技能需要的工具列表加入提示词
+        if req_tools and req_tools != "None explicitly listed.":
+            # 增加缩进对齐，使排版更美观
+            tools_indented = "\n    ".join(req_tools.split('\n'))
+            catalog += f"  - **[CRITICAL] Required Tools for this skill**:\n    {tools_indented}\n\n"
+        else:
+            catalog += "\n"
+
+    return catalog
+
+def get_skill_instructions_for_researcher(required_skills: List[str]) -> str:
+    """
+    为 Researcher 生成技能执行指南。
+    根据 Supervisor 派发的技能列表，注入完整 SOP（已剥离 frontmatter）。
+    """
+    if not required_skills:
+        return ""
+
+    all_skills = _load_all_skills()
+    instructions = "\n\n" + "=" * 40 + "\n"
+    instructions += "🚨 MANDATORY STANDARD OPERATING PROCEDURES (SOP) 🚨\n"
+    instructions += "You have been assigned specific skills for this task. You MUST strictly follow the operating procedures below:\n\n"
+
+    loaded_count = 0
+    for skill_id in required_skills:
+        if skill_id in all_skills:
+            body = all_skills[skill_id]
+            instructions += f"--- START OF SKILL: {skill_id} ---\n"
+            instructions += body
+            instructions += "\n--- END OF SKILL ---\n\n"
+            loaded_count += 1
+
+    if loaded_count == 0:
+        return ""
+
+    return instructions
 
 ##########################
 # Token 上限超限检测组件

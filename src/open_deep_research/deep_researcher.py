@@ -57,26 +57,27 @@ from open_deep_research.state import (
     TaskRouting,
 )
 from open_deep_research.utils import (
-    anthropic_websearch_called,
     get_all_tools,
     get_api_key_for_model,
     get_model_token_limit,
     get_today_str,
     is_token_limit_exceeded,
-    openai_websearch_called,
     remove_up_to_last_ai_message,
     think_tool,
-    quantitative_analysis_skill,
-    long_doc_mining_skill,
-    data_visualization_skill,
-    get_active_skills,
-    search_tools_catalog
+    fetch_webpage,
+    get_tool_catalog_for_supervisor,
+    get_skill_catalog_for_supervisor,
+    get_skill_instructions_for_researcher,
+    RESEARCH_TOOL_NAMES,
+    cleanup_mcp_sessions
 )
 
 # 初始化一个可配置的模型，将在整个智能体中使用
 configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key", "model_kwargs"),
 )
+LLM_CALL_TIMEOUT = 120  # 按你的模型实际响应时间调整
+
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["route_task", "__end__"]]:
     """分析用户消息，如果研究范围不清晰则提出澄清问题。
@@ -154,7 +155,7 @@ async def route_task(state: AgentState, config: RunnableConfig) -> Command[
         print("\n[🔀 智能路由] 识别为逻辑/计算题，启动思维链短路推理，跳过检索流程。")
         return Command(goto="direct_answering")
     else:
-        print("\n[🔀 智能路由] 识别为调研任务，进入多智能体深度检索流水线。")
+        print("\n[🔀 智能路由] 识别为调研任务，进入多智能体深度检索流程。")
         return Command(goto="write_research_brief")
 
 
@@ -224,10 +225,14 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
 
     # 第3步：使用研究简报和指令初始化主管智能体
+    skill_catalog_str = get_skill_catalog_for_supervisor()
+    tool_catalog_str = await get_tool_catalog_for_supervisor()
     supervisor_system_prompt = supervisor_prompt.format(
         date=get_today_str(),
         max_concurrent_research_units=configurable.max_concurrent_research_units,
-        max_researcher_iterations=configurable.max_researcher_iterations
+        max_researcher_iterations=configurable.max_researcher_iterations,
+        skill_catalog=skill_catalog_str,
+        tool_catalog=tool_catalog_str,
     )
 
     return Command(
@@ -269,7 +274,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     }
 
     # 可用工具：研究委派、完成信号、战略思考
-    lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool, search_tools_catalog]
+    lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool]
 
     # 如果是第一轮，死死锁住只能用 think_tool 思考；后续轮次强制要求必须调用任意工具（"any"）
     current_iteration = state.get("research_iterations", 0)
@@ -301,9 +306,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
 
     此函数处理三种类型的主管工具调用：
     1. think_tool - 战略反思，继续对话
-    2. search_tools_catalog - 在统一工具注册表中搜索本地系统技能和外部MCP集成。
-    3. ConductResearch - 将研究任务委派给子研究员
-    4. ResearchComplete - 标记研究阶段完成
+    2. ConductResearch - 将研究任务委派给子研究员
+    3. ResearchComplete - 标记研究阶段完成
 
     Args:
         state: 当前主管状态，包含消息和迭代计数
@@ -373,7 +377,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         # 如果还在容忍范围内，继续打回
         print(f"\n[拦截] Supervisor 输出了纯文本，强制打回 (第 {consecutive_errors + 1}/3 次警告)。")
         warning_msg = HumanMessage(
-            content="[SYSTEM ERROR] You MUST execute a tool call. Do not just output conversational text. Please call `think_tool`, `search_tools_catalog`, `ConductResearch`, or `ResearchComplete`. If you need to plan, put your text INSIDE the `think_tool` arguments!")
+            content="[SYSTEM ERROR] You MUST execute a tool call. Do not just output conversational text. Please call `think_tool`, `ConductResearch`, or `ResearchComplete`. If you need to plan, put your text INSIDE the `think_tool` arguments!")
         return Command(goto="supervisor", update={"supervisor_messages": [warning_msg]})
 
     # 第2步：同时处理所有工具调用（包括 think_tool 和 ConductResearch）
@@ -393,20 +397,6 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             tool_call_id=tool_call["id"]
         ))
 
-    # 处理 search_tools_catalog 调用
-    catalog_tool_calls = [
-        tc for tc in most_recent_message.tool_calls
-        if tc["name"] == "search_tools_catalog"
-    ]
-    for tc in catalog_tool_calls:
-        # 直接调用工具并返回观察结果
-        observation = await search_tools_catalog.ainvoke(tc["args"], config)
-        update_payload["supervisor_messages"].append(ToolMessage(
-            content=observation,
-            name=tc["name"],
-            tool_call_id=tc["id"]
-        ))
-
     # 处理 ConductResearch 调用（研究委派）
     conduct_research_calls = [
         tool_call for tool_call in most_recent_message.tool_calls
@@ -423,7 +413,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             send_actions.append(Send("researcher_subgraph", {
                 "researcher_messages": [HumanMessage(content=tool_call["args"]["research_topic"])],
                 "research_topic": tool_call["args"]["research_topic"],
-                "required_tools": tool_call["args"].get("required_tools", ["web_search", "fetch_webpage"]),
+                "required_tools": tool_call["args"].get("required_tools", []),
                 "required_skills": tool_call["args"].get("required_skills", []),
                 "tool_call_id": tool_call["id"]  # 注入溯源 ID
             }))
@@ -631,35 +621,31 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     # 获取所有可用的研究工具（搜索、MCP、think_tool）
     tools = await get_all_tools(config)
     if len(tools) == 0:
-        raise ValueError(
-            "未找到可用于研究的工具：请配置您的搜索 API 或在配置中添加 MCP 工具。"
-        )
+        raise ValueError("未找到可用于研究的工具。")
 
     # 精准挂载分配的工具
     allowed_tool_names = state.get("required_tools", ["think_tool", "ResearchComplete"])
     active_tools = []
 
-    tool_names = []
-    for tool in tools:
-        tool_name = tool.name if hasattr(tool, "name") else tool.get("name", "web_search")
-        # 永远保留思考节点，并挂载 Supervisor 准许的业务工具
-        if tool_name == "think_tool" or tool_name == "ResearchComplete" or tool_name in allowed_tool_names:
-            tool_names.append(tool_name)
-            active_tools.append(tool)
+    for tool_obj in tools:
+        tool_name = tool_obj.name if hasattr(tool_obj, "name") else tool_obj.get("name", "web_search")
+        if tool_name in RESEARCH_TOOL_NAMES or tool_name in allowed_tool_names:
+            active_tools.append(tool_obj)
 
-    # print(f"\n[🔧 工具挂载] 激活专属工具: {tool_names}")
+    print(f"\n[🔧 工具挂载] 激活专属工具: {allowed_tool_names}")
 
-    # 精准挂载分配的技能
+    # 获取 Supervisor 派发的技能名称列表
     assigned_skills = state.get("required_skills", [])
-    loaded_skills = get_active_skills(assigned_skills)
+    skill_instructions = get_skill_instructions_for_researcher(assigned_skills)
+    if skill_instructions:
+        print(f"\n[🔧 技能挂载] 已向 Researcher 注入 SOP 指南: {assigned_skills}")
 
-    if loaded_skills:
-        active_tools.extend(loaded_skills)
-        loaded_skill_names = [s.name for s in loaded_skills]
-        # print(f"\n[🔧 技能挂载] 激活专属技能: {loaded_skill_names}")
-
-    active_tool_names = [t.name if hasattr(t, "name") else t.get("name") for t in active_tools]
-    # print(f"\n[🎯 精准挂载] 任务: {state.get('research_topic', 'Unknown')[:15]}... | 武器: {active_tool_names}")
+    # 准备系统提示词，如果可用则包含 MCP 上下文
+    researcher_prompt = research_system_prompt.format(
+        mcp_prompt=configurable.mcp_prompt or "",
+        date=get_today_str(),
+        skill_instructions=skill_instructions  # <--- 在这里规范注入
+    )
 
     # 第2步：配置研究员模型及工具
     research_model_config = {
@@ -667,12 +653,6 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         "max_tokens": configurable.research_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.research_model, config)
     }
-
-    # 准备系统提示词，如果可用则包含 MCP 上下文
-    researcher_prompt = research_system_prompt.format(
-        mcp_prompt=configurable.mcp_prompt or "",
-        date=get_today_str()
-    )
 
     # 如果是第一轮，死死锁住只能用 think_tool 思考；后续轮次强制要求必须调用任意工具（"any"）
     current_iteration = state.get("tool_call_iterations", 0)
@@ -689,7 +669,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     # 第3步：使用系统上下文生成研究员响应
     messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
     try:
-        response = await research_model.ainvoke(messages)
+        response = await asyncio.wait_for(research_model.ainvoke(messages), timeout=LLM_CALL_TIMEOUT)
     except Exception as e:
         error_msg = str(e)
         if "JSON format" in error_msg or "400" in error_msg or "invalid_parameter_error" in error_msg:
@@ -723,21 +703,27 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     )
 
 # 工具执行辅助函数
-async def execute_tool_safely(tool, args, config):
-    """安全执行工具，带有错误处理。"""
+async def execute_tool_safely(tool, args, config, timeout=LLM_CALL_TIMEOUT):
     try:
-        return await tool.ainvoke(args, config)
+        return await asyncio.wait_for(tool.ainvoke(args, config), timeout=timeout)
+    except asyncio.TimeoutError:
+        return f"执行工具超时（>{timeout}s），已跳过。"
+    except BaseExceptionGroup as eg:
+        details = []
+        for sub in eg.exceptions:
+            details.append(f"{type(sub).__name__}: {sub}")
+        return f"执行工具时出错（TaskGroup 展开）: {'; '.join(details)}"
     except Exception as e:
-        return f"执行工具时出错：{str(e)}"
+        import traceback
+        return f"执行工具时出错：{type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "compress_research"]]:
     """执行研究员调用的工具，包括搜索工具和战略思考。
 
     此函数处理多种类型的研究员工具调用：
     1. think_tool - 战略反思，继续研究对话
-    2. 搜索工具（tavily_search, web_search）- 信息收集
-    3. MCP 工具 - 外部工具集成
-    4. ResearchComplete - 标记单个研究任务完成
+    2. MCP 工具 - 外部工具集成
+    3. ResearchComplete - 标记单个研究任务完成
 
     Args:
         state: 当前研究员状态，包含消息和迭代计数
@@ -759,12 +745,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
 
     # 如果没有工具调用，同样强制打回，禁止其提早进入 compress_research
     has_tool_calls = bool(most_recent_message.tool_calls)
-    has_native_search = (
-        openai_websearch_called(most_recent_message) or
-        anthropic_websearch_called(most_recent_message)
-    )
 
-    if not has_tool_calls and not has_native_search:
+    if not has_tool_calls:
         # 统计历史上已经报过几次 SYSTEM ERROR
         error_count = sum(1 for m in researcher_messages if
                           getattr(m, "type", "") == "human" and "[SYSTEM ERROR]" in getattr(m, "content", ""))
@@ -778,21 +760,11 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             content="[SYSTEM ERROR] You MUST call a tool (e.g., `web_search`, a skill, or `ResearchComplete`). Do not output plain conversational text.")
         return Command(goto="researcher", update={"researcher_messages": [warning_msg]})
 
-    # 第2步：处理工具调用（搜索、MCP 工具、skills等）
+    # 第2步：处理工具调用
     tools = await get_all_tools(config)
-    from open_deep_research.utils import _mcp_client
-    if _mcp_client is not None:
-        try:
-            mcp_tools = await _mcp_client.get_tools()
-            tools.extend(mcp_tools)
-        except Exception:
-            pass
-    # 动态合并分配到的所有技能
-    assigned_skills = state.get("required_skills", [])
-    tools.extend(get_active_skills(assigned_skills))
 
     tools_by_name = {
-        tool.name if hasattr(tool, "name") else tool.get("name", "web_search"): tool
+        tool.name if hasattr(tool, "name") else tool.get("name",""): tool
         for tool in tools
     }
 
