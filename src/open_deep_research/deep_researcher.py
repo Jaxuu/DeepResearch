@@ -638,7 +638,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     assigned_skills = state.get("required_skills", [])
     skill_instructions = get_skill_instructions_for_researcher(assigned_skills)
     if skill_instructions:
-        print(f"\n[🔧 技能挂载] 已向 Researcher 注入 SOP 指南: {assigned_skills}")
+        print(f"\n[🔧 技能挂载] 已向 Researcher 注入 skills: {assigned_skills}")
 
     # 准备系统提示词，如果可用则包含 MCP 上下文
     researcher_prompt = research_system_prompt.format(
@@ -776,7 +776,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         if tool_name not in tools_by_name:
             print(f"\n[拦截] 拒绝未授权工具调用: {tool_name}")
             return f"[System Error] Access Denied: Tool '{tool_name}' is not assigned to your current context. Please use ONLY the tools provided to you."
-        return await execute_tool_safely(tools_by_name[tool_name], tc["args"], config)
+        return await execute_tool_safely(tools_by_name[tool_name], tc["args"], config, timeout=180.0)
 
     # 并行执行所有工具调用（包含非法调用的报错返回）
     tool_execution_tasks = [safe_tool_runner(tc) for tc in tool_calls]
@@ -829,6 +829,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     model_config = {
         "model": configurable.compression_model,
         "max_tokens": configurable.compression_model_max_tokens,
+        "temperature": 0.0,
         "api_key": get_api_key_for_model(configurable.compression_model, config),
         "tags": ["langsmith:nostream"]
     }
@@ -854,7 +855,10 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     while synthesis_attempts < max_attempts:
         try:
             # 执行压缩， 强制挂载 FactBoard 结构化输出
-            response = await structured_synthesizer_model.ainvoke(messages)
+            response = await asyncio.wait_for(
+                structured_synthesizer_model.ainvoke(messages),
+                timeout=180.0
+            )
 
             # 用 Python 物理提取图表，绝对不依赖大模型的自觉性
             for msg in state.get("researcher_messages", []):
@@ -966,10 +970,28 @@ supervisor_builder.add_edge("researcher_subgraph", "evaluate_research")
 supervisor_subgraph = supervisor_builder.compile()
 
 
-async def generate_outline(state: AgentState, config: RunnableConfig) -> Command[Literal["write_section"]]:
+async def generate_outline(state: AgentState, config: RunnableConfig) -> Command[Literal["write_section", "__end__"]]:
     """生成大纲并完成数据路由，下发切片后的事实给并发节点。"""
     configurable = Configuration.from_runnable_config(config)
     structured_facts = state.get("structured_facts", [])
+
+    # ===== 空事实守卫 =====
+    # 如果整个 Supervisor 阶段没有收集到任何事实，直接短路到 END，
+    # 输出明确的 NOT_FOUND，防止 writer 在空 findings 上瞎编出幻觉答案。
+    if not structured_facts:
+        print("\n[🛑 空事实熔断] structured_facts 为空，跳过成文阶段，直接返回 NOT_FOUND。")
+        empty_report = "### Final Answer\n\nNOT_FOUND\n\n[SYSTEM: RESEARCH_FAILED — no facts were collected during the supervisor phase.]"
+        return Command(
+            goto=END,
+            update={
+                "final_report": empty_report,
+                "messages": [AIMessage(content=empty_report)],
+                # 清空 section_drafts，保持状态干净
+                "section_drafts": {"type": "override", "value": []},
+                # 给下游一个明确的空大纲，防止 report_outline 残留脏数据
+                "report_outline": [],
+            }
+        )
 
     # 极简模式：只给模型看 Entity 和截断的 Claim，并附带明确的 ID (索引)
     formatted_findings = "\n".join([
@@ -1103,7 +1125,7 @@ async def write_section(state: WriteSectionState, config: RunnableConfig):
         # 检查大模型是否漏掉了图表或篡改了链接
         for chart in chart_links:
             if chart not in final_text:
-                # 如果原封不动的图表链接不在正文里，说明大模型犯病了，我们强行补在章节最后
+                # 如果原封不动的图表链接不在正文里，说明大模型犯病了，强行补在章节最后
                 final_text += f"\n\n{chart}\n\n"
 
         return {

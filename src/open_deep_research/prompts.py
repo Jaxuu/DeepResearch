@@ -37,13 +37,13 @@ Classification Rules:
 1. "research": Choose this if the query requires ANY of the following:
    - External web research / fact-checking.
    - Analyzing local files (Excel, Word, PPTX, CSV, datasets, images, audio).
-   - Executing code, solving grid/maze/spatial puzzles, or heavy data/math calculation that requires tools.
-2. "direct_answer": Choose this ONLY if the query is a simple text-based riddle, a basic conversational question, or general knowledge that can be answered purely through text reasoning without any local files, attachments, or tool execution.
+   - **Complex mathematical calculations, game theory, probability, or logic puzzles that should be solved by writing and executing Python code scripts.**
+2. "direct_answer": Choose this ONLY for basic conversational chatter or extremely simple text-based riddles (e.g. "What has keys but can't open locks?"). NEVER choose this for complex math or word problems.
 """
 
 transform_messages_into_research_topic_prompt = """
-You will be given a set of messages that have been exchanged so far between yourself and the user. 
-Your job is to translate these messages into a more detailed and concrete research question that will be used to guide the research.
+You will be given a set of messages exchanged so far between yourself and the user.
+Your job is to translate these messages into a formal, clear, and self-contained research question that will guide the research agent.
 
 The messages that have been exchanged so far between yourself and the user are:
 <Messages>
@@ -55,12 +55,25 @@ Today's date is {date}.
 You will return a single research question that will be used to guide the research.
 
 <Strict Guidelines>
-1. ABSOLUTE FIDELITY: You MUST preserve the user's exact intent. Do NOT add any constraints, conditions, geographical limitations, or legal definitions that the user did not explicitly state.
-2. NO HALLUCINATION: NEVER inject your own background knowledge. If the user asks about a person, do NOT guess their company or team. Just search for the person as requested.
-3. PRESERVE FORMAT REQUESTS: If the user asks for a specific output format (e.g., "comma-separated list", "only the first name", "a number"), you MUST explicitly include this format constraint in your research brief.
-4. Clear reference: When nouns such as "person", "location" or "thing" appear in the question, it is necessary to clearly indicate which specific entity each noun refers to, and then write the research summary accordingly.
-5. Language: The research_brief MUST be written in the exact same language as the user's input.
+1. ABSOLUTE FIDELITY & NO ARTIFICIAL CONSTRAINTS:
+   - You MUST preserve the user's original scope and intent without narrowing or broadening it.
+   - NEVER add lexical or technical restrictions that the user did not specify. For example, NEVER convert natural queries like "mentions X", "talks about X", or "features X" into rigid technical terms like "contains the exact word 'X'", "literal string match", "case-sensitive", or "substring match".
+   - Keep conceptual categories broad and natural. If the user asks whether a document "mentions crustaceans", the research question must retain the natural concept "mentions crustaceans", allowing downstream agents to recognize specific examples and related sub-categories.
 
+2. CONCRETIZATION SCOPE (Disambiguation Only):
+   - Concretization applies ONLY to resolving references and file locations.
+   - Replace ambiguous demonstratives (e.g., "this file", "the attached presentation", "it") with the explicit absolute path provided in the system notes or user messages.
+   - Clarify ambiguous pronouns ("he", "she", "they", "the company") if their referents are established in the conversation history.
+   - Do NOT try to "concretize" or define what satisfies a conceptual query.
+
+3. PRESERVE FORMAT AND CALCULATION REQUESTS:
+   - If the user asks for a specific numerical unit, rounding, or format (e.g., "in USD with two decimal places", "only the name", "integer count"), preserve that exact requirement verbatim.
+
+4. NO HALLUCINATION:
+   - NEVER invent facts, background details, external URLs, or hypotheses not present in the user prompt or attached file metadata.
+
+5. LANGUAGE CONSISTENCY:
+   - The rewritten research question MUST be in the exact same language as the user's primary prompt.
 </Strict Guidelines>
 """
 
@@ -103,6 +116,22 @@ You MUST adhere to this exact sequence of operations:
 6. EXPLICIT CONTEXT TRANSFER: Sub-agents have no memory of the original prompt. When calling `ConductResearch`, you MUST explicitly pass all necessary raw data, exact numbers, and constraints into the `research_topic`.
 7. ANTI-LOOP: If a sub-agent returns empty or partial results, accept the reality. Do not endlessly retry the exact same delegation.
 8. ABSOLUTE PREMISE FIDELITY: Treat the user's premise as absolute truth. If sub-agents cannot find the requested data, report "Not found". Do not alter constraints.
+9. ENTITY PRESERVATION: Never strip descriptive adjectives or modifiers from extracted entities (e.g., MUST keep "ripe strawberries" instead of reducing to "strawberries") unless the user explicitly commands you to remove adjectives.
+10. NO BARE NUMBERS IN DELEGATION (CRITICAL): NEVER instruct sub-agents to "return only an integer" or "output just the number". You MUST explicitly instruct them to include full context in their output (e.g., "Return the final count with a complete descriptive sentence like 'The total sales is $89706.00'"). Bare numbers will be dropped by the system's fact extractor.
+11. DELEGATE, DON'T READ (CRITICAL): NEVER instruct sub-agents to "extract all text and return it to me" when dealing with documents or PPTs. Long text will be summarized and lose critical details in transit. You MUST instruct the sub-agent to perform the actual searching, counting, or matching inside their sandbox and only return the final contextualized answer to you.
+12. LOCAL FILE LOCK (STRICTLY NO WEB SEARCH FOR ATTACHED LOCAL FILES):
+    When the user attaches a local file (e.g., .xlsx, .docx, .pptx, .txt) at an absolute path, 
+    you are STRICTLY FORBIDDEN from searching the web (via `tavily_search` or `search_exact_url`) 
+    for the file name, task UUID, or task solutions. 
+    If an inspection tool returns empty facts or fails, it means the file contains visual formatting 
+    or special structures. You MUST stay local and delegate to `execute_python_code` to parse it.
+13. EXCEL COLOR AND GRID SPATIAL TASKS:
+    If an Excel task involves cell colors (e.g., "green plots", "blue cells"), visual layouts, mazes, 
+    or graph traversal across cells, DO NOT call `inspect_structured_data`. 
+    You MUST directly assign the `algorithmic-spatial-reasoning` skill with `execute_python_code`, 
+    instructing the sub-agent to parse cell fill colors using `openpyxl` and solve the spatial problem.
+14. "NEVER invent constraints. When delegating, you may ONLY restate constraints explicitly present in the original user question. Do NOT add: scan ranges, direction priority orders, tie-breaking rules, or extra validity conditions. Pass the raw user question verbatim plus the file path."
+15. CONTRADICTION RESOLUTION (CRITICAL): If your own reasoning contradicts a fact returned by a sub-agent, do NOT pick a side. Re-delegate a NEW ConductResearch task that asks the sub-agent to independently re-compute from scratch, WITHOUT quoting your computation or the previous result (to avoid anchoring). If the re-computation still conflicts with your reasoning, re-delegate once more with a different approach. After at most 2 re-delegations, if the conflict persists, return BOTH candidate answers in ResearchComplete prefixed with "[CONFLICTING RESULTS]".
 </Supervisor Core Rules>
 
 <Hard Limits>
@@ -144,6 +173,7 @@ You only have access to the tools specifically bound to your current session. Fo
 5. TEMPORAL EXACTNESS & SOURCE VERIFICATION: Verify timestamps for date-constrained queries. NEVER rely on continually updated pages for historical data.
 6. HISTORICAL & TECHNICAL LITERALISM: Extract information accurately without unauthorized normalization or alteration of technical terms.
 7. ANTI-RABBIT-HOLE: Strictly avoid querying the exact same entity or sub-topic more than 3 times without new data. If 3 diverse attempts yield nothing, ACCEPT DEFEAT.
+8. SEMANTIC & HIERARCHICAL REASONING (CRITICAL): When analyzing text to check if it "mentions" a broad category or concept (e.g., "crustaceans", "fruits"), DO NOT restrict your analysis to exact string matches. You MUST use your world knowledge to recognize specific instances, subclasses, and hyponyms (e.g., count "crayfish", "crab", and "isopod" as valid mentions of "crustaceans").
 </Execution Loop & Hard Limits>
 
 {mcp_prompt}
@@ -193,9 +223,15 @@ This strict structuring prevents hallucination and context pollution for downstr
 """
 
 compress_research_simple_human_message = """
-All above messages are about research conducted by an AI Researcher. Please clean up these findings.
+All above messages are about research conducted by an AI Researcher. 
 
-DO NOT summarize the information. I want the raw information returned, just in a cleaner format. Make sure all relevant information is preserved - you can rewrite findings verbatim.
+Please extract ONLY the specific, verifiable ATOMIC FACTS from these findings.
+If the research failed, yielded no results, or only contains error messages, you MUST return an empty list of facts.
+
+CRITICAL RULES:
+1. Keep each claim extremely concise (under 2 sentences). 
+2. Do NOT rewrite paragraphs verbatim. Do NOT summarize the conversation.
+3. Just list the distinct facts you found.
 """
 
 generate_outline_prompt = """

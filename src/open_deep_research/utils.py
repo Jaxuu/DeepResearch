@@ -303,22 +303,30 @@ async def get_mcp_tools_cached():
     return _cached_mcp_tools
 
 
-
-
 ##########################
 # 动态感知Tools
 ##########################
 
-# 1. MCP 远程工具白名单
+# 1. MCP 工具白名单
 ALLOWED_MCP_TOOLS = {
-    "tavily_search",               # Tavily 提供的标准搜索
-    "search_equipment_knowledge",  # 你的 RAG 检索
-    "query_erp_database",          # 你的 ERP 查询
-    "generate_chart_image",        # 生成图表图片
-    "calculate_with_python",       # Python 计算
-    "extract_from_long_document",  # 从长文档中提取信息
-    "analyze_webpage_visual_layout",  # 分析网页视觉布局
-    "execute_python_code",           # 执行 Python 代码
+    "search_equipment_knowledge",       # RAG 检索
+    "query_erp_database",               # ERP 查询
+    "tavily_search",                    # Tavily 提供的标准搜索
+    "extract_from_long_document",       # 从长文档中提取信息
+    "generate_chart_image",             # 生成图表图片
+    "analyze_webpage_visual_layout",    # 分析网页视觉布局
+    "calculate_with_python",            # Python 计算
+    "execute_python_code",              # 执行 Python 代码
+    "search_exact_url",                 # 准确搜索 URL
+    "transcribe_audio_file",            # 音频转文本
+    "fetch_video_transcript",           # 获取视频字幕文本
+    "analyze_local_image",              # 分析本地图片视觉布局
+    "analyze_video_visually",           # 视频视觉分析
+    "inspect_structured_data",          # 检查结构化数据
+    "read_pdf_by_page",                 # 读取 PDF 页面
+    "execute_local_python_script",      # 执行本地 Python 脚本
+    "unzip_and_list_directory",         # 解压并列出目录
+    "read_local_text_file",             # 读取本地文本文件
 }
 
 # 2. 本地原生工具注册表 (Native Tools Registry)

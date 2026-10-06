@@ -57,6 +57,12 @@ dependencies = [
     "python-docx>=1.2.0",
     "python-pptx>=1.0.2",
     "numpy>=2.2.6",
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.8.19",
+    "opencv-python>=5.0.0.93",
+    "dashscope>=1.27.7",
+    "markitdown[audio-transcription]>=0.1.8",
+    "faster-whisper>=1.2.1",
 ]
 
 [project.optional-dependencies]

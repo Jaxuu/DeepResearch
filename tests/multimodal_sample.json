@@ -1,0 +1,72 @@
+[
+  {
+    "Question": "You are given this Excel file as a map. You start on the START cell and move toward the END cell. You are allowed to move two cells per turn, and you may move up, down, left, or right. You may not move fewer than two cells, and you may not move backward. You must avoid moving onto any blue cells. On the eleventh turn, what is the 6-digit hex code (without prefix) of the color of the cell where you land after moving?",
+    "Final answer": "F478A7",
+    "file_name": "65afbc8a-89ca-4ad5-8d62-355bb401f61d.xlsx"
+  },
+  {
+    "Question": "You are a telecommunications engineer who wants to build cell phone towers on a stretch of road. In the reference file is a layout of the road and nearby houses. Each dash, \"-\", is a marker indicating a mile. Each capital H indicates a house located next to a mile marker, appearing above or below the stretch of road. Each cell phone tower can cover houses located next to the road within a 4-mile radius. Find the minimum number of cell phone towers needed to cover all houses next to the road. Your answer should be a positive numerical integer value.",
+    "Final answer": "3",
+    "file_name": "389793a7-ca17-4e82-81cb-2b3a2391b4b9.txt"
+  },
+  {
+    "Question": "Each cell in the attached spreadsheet represents a plot of land. The color of the cell indicates who owns that plot. Green cells are plots owned by Earl Smith. Can Earl walk through every plot he owns (and no other plots) and return to his starting plot without backtracking? For this question, consider backtracking to be any instance where Earl would enter a plot of land he had already entered since leaving his starting plot.",
+    "Final answer": "No",
+    "file_name": "5cfb274c-0207-4aa7-9575-6ac0bd95d9b2.xlsx"
+  },
+  {
+    "Question": "In the video https://www.youtube.com/watch?v=L1vXCYZAYYM, what is the highest number of bird species to be on camera simultaneously?",
+    "Final answer": "3",
+    "file_name": ""
+  },
+  {
+    "Question": "Examine the video at https://www.youtube.com/watch?v=1htKBjuUWec.\n\nWhat does Teal'c say in response to the question \"Isn't that hot?\"",
+    "Final answer": "Extremely",
+    "file_name": ""
+  },
+  {
+    "Question": "On the BBC Earth YouTube video of the Top 5 Silliest Animal Moments, what species of bird is featured?",
+    "Final answer": "Rockhopper penguin",
+    "file_name": ""
+  },
+  {
+    "Question": "Hi, I'm making a pie but I could use some help with my shopping list. I have everything I need for the crust, but I'm not sure about the filling. I got the recipe from my friend Aditi, but she left it as a voice memo and the speaker on my phone is buzzing so I can't quite make out what she's saying. Could you please listen to the recipe and list all of the ingredients that my friend described? I only want the ingredients for the filling, as I have everything I need to make my favorite pie crust. I've attached the recipe as Strawberry pie.mp3.\n\nIn your response, please only list the ingredients, not any measurements. So if the recipe calls for \"a pinch of salt\" or \"two cups of ripe strawberries\" the ingredients on the list would be \"salt\" and \"ripe strawberries\".\n\nPlease format your response as a comma separated list of ingredients. Also, please alphabetize the ingredients.",
+    "Final answer": "cornstarch, freshly squeezed lemon juice, granulated sugar, pure vanilla extract, ripe strawberries",
+    "file_name": "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3.mp3"
+  },
+  {
+    "Question": "Hi, I was out sick from my classes on Friday, so I'm trying to figure out what I need to study for my Calculus mid-term next week. My friend from class sent me an audio recording of Professor Willowbrook giving out the recommended reading for the test, but my headphones are broken :(\n\nCould you please listen to the recording for me and tell me the page numbers I'm supposed to go over? I've attached a file called Homework.mp3 that has the recording. Please provide just the page numbers as a comma-delimited list. And please provide the list in ascending order.",
+    "Final answer": "132, 133, 134, 197, 245",
+    "file_name": "1f975693-876d-457b-a649-393859e79bf3.mp3"
+  },
+  {
+    "Question": "How many slides in this PowerPoint presentation mention crustaceans?",
+    "Final answer": "4",
+    "file_name": "a3fbeb63-0e8c-4a11-bff6-0e3b484c3e9c.pptx"
+  },
+  {
+    "Question": "An office held a Secret Santa gift exchange where each of its twelve employees was assigned one other employee in the group to present with a gift. Each employee filled out a profile including three likes or hobbies. On the day of the gift exchange, only eleven gifts were given, each one specific to one of the recipient's interests. Based on the information in the document, who did not give a gift?",
+    "Final answer": "Fred",
+    "file_name": "cffe0e32-c9a6-4c52-9877-78ceb4aaa9fb.docx"
+  },
+  {
+    "Question": "What is the final numeric output from the attached Python code?",
+    "Final answer": "0",
+    "file_name": "f918266a-b3e0-4914-865d-4faa564f1aef.py"
+  },
+  {
+    "Question": "The attached Excel file contains the sales of menu items for a local fast-food chain. What were the total sales that the chain made from food (not including drinks)? Express your answer in USD with two decimal places.",
+    "Final answer": "89706.00",
+    "file_name": "7bd855d8-463d-4ed5-93ca-5fe35145f733.xlsx"
+  },
+  {
+    "Question": "Review the chess position provided in the image. It is black's turn. Provide the correct next move for black which guarantees a win. Please provide your response in algebraic notation.",
+    "Final answer": "Rd5",
+    "file_name": "cca530fc-4052-43b2-b130-b30968d8aa44.png"
+  },
+  {
+    "Question": "As a comma separated list with no whitespace, using the provided image provide all the fractions that use / as the fraction line and the answers to the sample problems. Order the list by the order in which the fractions appear.",
+    "Final answer": "3/4,1/4,3/4,3/4,2/4,1/2,5/35,7/21,30/5,30/5,3/4,1/15,1/3,4/9,1/8,32/23,103/1.070",
+    "file_name": "9318445f-fe6a-4e1b-acbf-c68228c9906a.png"
+  }
+]
